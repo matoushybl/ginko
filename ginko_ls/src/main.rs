@@ -7,12 +7,20 @@ use tower_lsp::{LspService, Server};
 struct Args {
     #[arg(short, long, help = "Add a path to search for include files")]
     include: Option<Vec<String>>,
+
+    #[arg(
+        short,
+        long,
+        help = "Add a directory with devicetree binding files used for completion"
+    )]
+    bindings: Option<Vec<String>>,
 }
 
 #[tokio::main]
 pub async fn main() {
     let args = Args::parse();
     let include_paths = args.include.unwrap_or_default();
+    let bindings_paths = args.bindings.unwrap_or_default();
     // Log to stderr instead of stdout since communication with the language server client
     // happens through stdout
     tracing_subscriber::fmt()
@@ -22,7 +30,9 @@ pub async fn main() {
     let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
 
     let (service, socket) = LspService::new(move |client| {
-        Backend::new("ginko_ls", client).with_include_paths(include_paths)
+        Backend::new("ginko_ls", client)
+            .with_include_paths(include_paths)
+            .with_bindings_paths(bindings_paths)
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

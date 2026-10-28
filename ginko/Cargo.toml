@@ -15,6 +15,7 @@ assert_matches = "1"
 clap = { version = "4", features = ["derive"] }
 enum-map = "2"
 itertools = "0.13.0"
+serde_yaml = "0.9"
 strum = { version = "0.26.3", features = ["derive"] }
 url = "2"
 

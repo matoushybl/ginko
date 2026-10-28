@@ -1,6 +1,7 @@
 /// Module for analyzing Device-Tree Source files
 mod analysis;
 mod ast;
+mod bindings;
 mod data;
 mod diagnostics;
 mod error_codes;
@@ -16,6 +17,7 @@ mod tokens;
 mod visitor;
 
 pub use ast::{AnyDirective, Node, NodeItem, NodePayload, Primary};
+pub use bindings::{Bindings, CompletionSchema, PropertyHint, node_compatibles};
 pub use data::{FileType, HasSource, HasSpan, Position, Span};
 pub use diagnostics::{Diagnostic, DiagnosticPrinter, Severity};
 pub use error_codes::{ErrorCode, SeverityMap};

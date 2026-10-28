@@ -98,6 +98,13 @@ impl ResolvedNode {
     }
 }
 
+impl ResolvedProperty {
+    /// The merged property definition this resolution is based on.
+    pub fn property(&self) -> &Property {
+        &self.inner
+    }
+}
+
 #[derive(Default)]
 pub struct ResolvedTree {
     root: ResolvedNode,

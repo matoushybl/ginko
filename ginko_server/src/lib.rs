@@ -1,7 +1,7 @@
 use ginko::dts::{
-    AnyDirective, FileType, HasSpan, IncludeLoader, IncludeLoaderGuard, IncludeLoaderNotifyAction,
-    ItemAtCursor, Node, NodeItem, NodePayload, ParserConfig, Primary, Project, ResolvedContext,
-    ResolvedNode, Severity, SeverityMap, Span,
+    AnyDirective, Bindings, FileType, HasSpan, IncludeLoader, IncludeLoaderGuard,
+    IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload, ParserConfig, Primary,
+    Project, ResolvedContext, ResolvedNode, Severity, SeverityMap, Span, node_compatibles,
 };
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -20,6 +20,7 @@ pub struct Backend {
     project: RwLock<Project>,
     severities: SeverityMap,
     loader: RwLock<IncludeLoaderGuard>,
+    bindings: Bindings,
 }
 
 impl Backend {
@@ -30,6 +31,7 @@ impl Backend {
             project: RwLock::new(Project::default()),
             severities: SeverityMap::default(),
             loader: RwLock::new(IncludeLoaderGuard::default()),
+            bindings: Bindings::default(),
         }
     }
 }
@@ -78,6 +80,19 @@ impl Backend {
     /// project's include loader.
     pub fn with_include_paths(self, include_paths: Vec<String>) -> Self {
         self.loader.write().set_include_paths(include_paths);
+        self
+    }
+
+    /// Configure the binding directories (the `-b/--bindings` values passed
+    /// to the binary) powering binding-based completion.
+    pub fn with_bindings_paths(mut self, binding_paths: Vec<String>) -> Self {
+        let paths: Vec<PathBuf> = binding_paths.iter().map(PathBuf::from).collect();
+        self.bindings = Bindings::from_paths(&paths);
+        tracing::info!(
+            "bindings: indexed {} schemas over {} compatible strings",
+            self.bindings.schema_count(),
+            self.bindings.compatible_count()
+        );
         self
     }
 
@@ -332,7 +347,10 @@ impl LanguageServer for Backend {
             ))
         }
 
-        fn completions_for_node(rnode: &ResolvedNode) -> Option<CompletionResponse> {
+        fn completions_for_node(
+            rnode: &ResolvedNode,
+            bindings: &Bindings,
+        ) -> Option<CompletionResponse> {
             let mut items = vec![];
             for name in rnode.active_child_nodes() {
                 let snippet = format!("{name} {{\n\t$0\n}};");
@@ -358,6 +376,39 @@ impl LanguageServer for Backend {
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                     ..Default::default()
                 });
+            }
+            // Binding-derived property suggestions: the node's compatibles
+            // (overlay-merged, so `&ref { }` blocks see the base dtsi's
+            // compatible) map to binding schemas with the allowed properties.
+            for (name, hint) in bindings.properties_for(&node_compatibles(rnode)) {
+                if items.iter().any(|item| item.label == name) {
+                    continue;
+                }
+                let snippet = if hint.boolean {
+                    format!("{name};")
+                } else {
+                    format!("{name} = $0;")
+                };
+                let detail = if hint.required {
+                    "required property".to_string()
+                } else {
+                    hint.type_hint.unwrap_or_else(|| "property".to_string())
+                };
+                let mut item = CompletionItem {
+                    label: name,
+                    detail: Some(detail),
+                    kind: Some(CompletionItemKind::FIELD),
+                    insert_text: Some(snippet),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                };
+                if let Some(description) = hint.description {
+                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: description,
+                    }));
+                }
+                items.push(item);
             }
             Some(CompletionResponse::Array(items))
         }
@@ -397,7 +448,7 @@ impl LanguageServer for Backend {
                     return Ok(completions_for_reference(&project, &file_path, token));
                 }
 
-                return Ok(completions_for_node(rnode));
+                return Ok(completions_for_node(rnode, &self.bindings));
             }
             Some(ResolvedContext::Property(_)) => {
                 if let Some(token) = token.strip_prefix('&') {
