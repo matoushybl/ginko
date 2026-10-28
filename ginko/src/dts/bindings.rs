@@ -59,6 +59,11 @@ pub struct Bindings {
     /// compatible string -> indices into `schemas`
     by_compatible: BTreeMap<String, Vec<usize>>,
     schemas: Vec<CompletionSchema>,
+    /// Property hints from compatible-less common-part schemas ($ref'ed
+    /// property sets like leds/common.yaml or dt-schema's status.yaml).
+    /// Consulted for VALUE completion only — their property names are
+    /// deliberately not suggested universally.
+    common: BTreeMap<String, PropertyHint>,
 }
 
 impl Bindings {
@@ -125,30 +130,21 @@ impl Bindings {
     }
 
     fn add_schema(&mut self, file: PathBuf, binding: &Value) {
-        let Some(compatibles) = compatible_candidates(binding) else {
+        let Some(compatible) = binding.get("properties").and_then(|props| props.get("compatible"))
+        else {
+            // Schemas without a `compatible` are common-part schemas; they
+            // contribute value candidates instead of matching nodes.
+            self.add_common_schema(binding);
             return;
         };
+        let mut compatibles = Vec::new();
+        collect_compatible_strings(compatible, &mut compatibles);
+        compatibles.sort();
+        compatibles.dedup();
         if compatibles.is_empty() {
             return;
         }
-        let mut required = BTreeSet::new();
-        if let Some(Value::Sequence(items)) = binding.get("required") {
-            for item in items {
-                if let Some(name) = item.as_str() {
-                    required.insert(name.to_string());
-                }
-            }
-        }
-        let mut properties = BTreeMap::new();
-        if let Some(Value::Mapping(props)) = binding.get("properties") {
-            for (name, sub) in props.iter() {
-                if let Some(name) = name.as_str() {
-                    // `properties` carries nested node schemas as well; every
-                    // key is a devicetree name in the end, so none are skipped.
-                    properties.insert(name.to_string(), property_hint(sub, required.contains(name)));
-                }
-            }
-        }
+        let properties = extract_properties(binding);
         self.schemas.push(CompletionSchema {
             file,
             properties,
@@ -160,6 +156,39 @@ impl Bindings {
                 .or_default()
                 .push(idx);
         }
+    }
+
+    /// Hints from common-part schemas merge by property name; their value
+    /// candidates dedupe across files. See `common`.
+    fn add_common_schema(&mut self, binding: &Value) {
+        for (name, hint) in extract_properties(binding) {
+            let entry = self.common.entry(name).or_default();
+            entry.required |= hint.required;
+            entry.boolean |= hint.boolean;
+            entry.deprecated |= hint.deprecated;
+            for value in hint.values {
+                if !entry.values.contains(&value) {
+                    entry.values.push(value);
+                }
+            }
+            if entry.type_hint.is_none() {
+                entry.type_hint = hint.type_hint;
+            }
+            if entry.description.is_none() {
+                entry.description = hint.description;
+            }
+        }
+    }
+
+    /// Value candidates for a property from common-part schemas — matched by
+    /// property name, e.g. `status` from dt-schema's status.yaml or `color`
+    /// from leds/common.yaml. Called when the node's own bindings have no
+    /// candidates for the property.
+    pub fn common_values(&self, name: &str) -> &[String] {
+        self.common
+            .get(name)
+            .map(|hint| hint.values.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -178,17 +207,36 @@ pub fn node_compatibles(rnode: &ResolvedNode) -> Vec<String> {
         .collect()
 }
 
-/// Collect the `compatible` candidate strings of a binding by walking the
-/// `properties.compatible` sub-schema (`oneOf`/`items`/`enum`/`const` soup).
-/// Returns `None` when the file has no compatible property at all (e.g.
-/// common-part schemas) — those bindings simply do not match.
-fn compatible_candidates(binding: &Value) -> Option<Vec<String>> {
-    let compatible = binding.get("properties")?.get("compatible")?;
-    let mut out = Vec::new();
-    collect_compatible_strings(compatible, &mut out);
-    out.sort();
-    out.dedup();
-    Some(out)
+/// The binding's `required:` list.
+fn required_set(binding: &Value) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    if let Some(Value::Sequence(items)) = binding.get("required") {
+        for item in items {
+            if let Some(name) = item.as_str() {
+                required.insert(name.to_string());
+            }
+        }
+    }
+    required
+}
+
+/// The binding's `properties:` map distilled to hinted entries. `properties`
+/// carries nested node schemas as well; every key is a devicetree name in
+/// the end, so none are skipped.
+fn extract_properties(binding: &Value) -> BTreeMap<String, PropertyHint> {
+    let required = required_set(binding);
+    let mut properties = BTreeMap::new();
+    if let Some(Value::Mapping(props)) = binding.get("properties") {
+        for (name, sub) in props.iter() {
+            if let Some(name) = name.as_str() {
+                properties.insert(
+                    name.to_string(),
+                    property_hint(sub, required.contains(name)),
+                );
+            }
+        }
+    }
+    properties
 }
 
 fn collect_compatible_strings(value: &Value, out: &mut Vec<String>) {
@@ -522,6 +570,34 @@ properties:
         // child-node property schemas are not descended into
         let ports = &properties["ports"];
         assert!(ports.values.is_empty());
+    }
+
+    const COMMON_BINDING: &str = r#"
+properties:
+  status:
+    description: indicates the operational status
+    enum:
+      - okay
+      - disabled
+  shared-thing: true
+"#;
+
+    #[test]
+    pub fn common_schemas_contribute_only_value_candidates() {
+        let mut bindings = Bindings::default();
+        let common: Value = serde_yaml::from_str(COMMON_BINDING).unwrap();
+        bindings.add_schema(PathBuf::from("status.yaml"), &common);
+
+        // no compatible => no schema => property-name completion unaffected
+        assert_eq!(bindings.schema_count(), 0);
+        assert!(bindings.properties_for(&["whatever".to_string()]).is_empty());
+
+        // value candidates come from the common set, matched by name
+        assert_eq!(
+            bindings.common_values("status").to_vec(),
+            vec!["okay".to_string(), "disabled".to_string()]
+        );
+        assert!(bindings.common_values("shared-thing").is_empty());
     }
 
     #[test]

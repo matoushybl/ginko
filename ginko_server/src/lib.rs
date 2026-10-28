@@ -423,11 +423,18 @@ impl LanguageServer for Backend {
             bindings: &Bindings,
         ) -> Option<CompletionResponse> {
             let name = property.property().name.item();
-            let candidates = bindings
-                .properties_for(&node_compatibles(rnode))
-                .get(name)?
-                .values
+            let properties = bindings.properties_for(&node_compatibles(rnode));
+            let mut sources: Vec<&[String]> = properties
+                .get(name)
+                .map(|hint| hint.values.as_slice())
+                .into_iter()
+                .collect();
+            if sources.first().is_none_or(|values| values.is_empty()) {
+                sources.push(bindings.common_values(name));
+            }
+            let candidates = sources
                 .iter()
+                .flat_map(|values| values.iter())
                 .map(|value| CompletionItem {
                     label: value.clone(),
                     detail: Some(format!("{name} value")),
