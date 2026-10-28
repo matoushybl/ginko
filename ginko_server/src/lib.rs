@@ -1,7 +1,8 @@
 use ginko::dts::{
-    AnyDirective, Bindings, FileType, HasSpan, IncludeLoader, IncludeLoaderGuard,
-    IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload, ParserConfig, Primary,
-    Project, ResolvedContext, ResolvedNode, Severity, SeverityMap, Span, node_compatibles,
+    AnyDirective, Bindings, CompletionContext, FileType, HasSpan, IncludeLoader,
+    IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload,
+    ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, Severity, SeverityMap, Span,
+    node_compatibles,
 };
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -262,7 +263,10 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let Some(file_path) = self.url_to_file_path(&params.text_document.uri).await else {
+        let Some(file_path) = self
+            .url_to_file_path(&params.text_document.uri)
+            .await
+        else {
             return;
         };
         let file_type = FileType::from(file_path.as_path());
@@ -467,6 +471,20 @@ impl LanguageServer for Backend {
                     {
                         return Ok(completions_for_root());
                     }
+                }
+
+                // No `&ref` context — fall back to span-based resolution of
+                // the node the cursor is inside (mid-payload completion).
+                match project.completion_context_at(&file_path, &pos) {
+                    // The cursor is inside a node body with no `&ref` under it:
+                    // complete the node — including binding-derived properties.
+                    Some(CompletionContext::InNode(rnode)) => {
+                        return Ok(completions_for_node(rnode, &self.bindings))
+                    }
+                    // Inside an existing property: property names make no
+                    // sense there. Value completion is a later phase.
+                    Some(CompletionContext::InProperty(..)) => {}
+                    Some(CompletionContext::TopLevel) | None => {}
                 }
             }
         }

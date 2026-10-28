@@ -591,6 +591,13 @@ impl Analysis {
             .get_absolute_path_from_reference_in_root_ctx(ctx, &node.reference)
             .unwrap_or(ABSOLUTE_ROOT.clone());
 
+        // The referenced-node element itself is a definition of the merged
+        // node in this file (its properties land there via
+        // `analyze_node_payload`) — register the span so that completing
+        // inside `&ref { … }` bodies resolves to the enclosing node.
+        self.context
+            .resolved
+            .add_node_span(&path, node.span, ctx.source.clone());
         self.analyze_node_payload(ctx, &node.payload, &path);
     }
 

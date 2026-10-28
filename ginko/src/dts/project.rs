@@ -4,7 +4,7 @@ use crate::dts::data::HasSource;
 use crate::dts::error_codes::{ErrorCode, SeverityMap};
 use crate::dts::loader::IncludeLoaderGuard;
 use crate::dts::reader::ByteReader;
-use crate::dts::resolved::{ResolvedContext, ResolvedNode};
+use crate::dts::resolved::{CompletionContext, ResolvedContext, ResolvedNode};
 use crate::dts::tokens::Lexer;
 use crate::dts::visitor::{ItemAtCursor, ReferenceContext};
 use crate::dts::{Diagnostic, FileType, HasSpan, Parser, ParserConfig, Position, Severity, Span};
@@ -493,6 +493,29 @@ impl Project {
                         .map(ResolvedContext::Property)
                 })
             }
+        }
+    }
+
+    /// What a completion at `position` is inside: the enclosing merged node or
+    /// the property the position lies in. Unlike `context_at`, this does not
+    /// need a `&ref` under the cursor — it resolves the enclosing node via the
+    /// span geometry of the merged tree, so completion works while typing
+    /// inside node bodies. `None` when the file is not known to the project;
+    /// `TopLevel` when the position is outside any node.
+    pub fn completion_context_at(
+        &self,
+        path: &Path,
+        position: &Position,
+    ) -> Option<CompletionContext<'_>> {
+        let file = self.canonicalize(path).ok()?;
+        let analysis = self.get_analysis(path)?;
+        let tree = analysis.get_resolved_tree();
+        match tree.node_at_position(&file, position) {
+            Some(node) => match node.property_at_position(&file, position) {
+                Some(property) => Some(CompletionContext::InProperty(node, property)),
+                None => Some(CompletionContext::InNode(node)),
+            },
+            None => Some(CompletionContext::TopLevel),
         }
     }
 
@@ -1195,6 +1218,103 @@ mod tests {
         assert!(analysis.get_define("A_LOCAL").is_some()); // quoted .h
         assert!(analysis.get_define("B_LOCAL").is_some()); // angled via include path
         assert!(analysis.get_define("C_LOCAL").is_some()); // defined in the fragment itself
+    }
+
+    #[test]
+    pub fn completion_context_resolves_enclosing_node_mid_body() {
+        use crate::dts::Position;
+        use crate::dts::CompletionContext;
+        let temp_dir = TempDir::new();
+        let (_, main) = temp_dir.add_file(
+            "test.dts",
+            r#"/dts-v1/;
+/ {
+	outer {
+		inner {
+			prop = <1>;
+		};
+	};
+};"#,
+        );
+
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        project
+            .add_file(main.clone().into_os_string().into_string().unwrap(), &mut loader)
+            .expect("Cannot add file");
+
+        // top level, e.g. on the /dts-v1/ line
+        let Some(CompletionContext::TopLevel) =
+            project.completion_context_at(&main, &Position::new(0, 4))
+        else {
+            panic!("expected TopLevel on the /dts-v1/ line")
+        };
+
+        // on the `outer` node name — resolves to the outer node
+        let Some(CompletionContext::InNode(rnode)) =
+            project.completion_context_at(&main, &Position::new(2, 2))
+        else {
+            panic!("expected InNode on the outer node name")
+        };
+        assert!(rnode.active_child_nodes().contains(&"inner".to_string()));
+
+        // on the property name — resolves to the property and its node
+        let Some(CompletionContext::InProperty(rnode, property)) =
+            project.completion_context_at(&main, &Position::new(4, 4))
+        else {
+            panic!("expected InProperty on the property name")
+        };
+        assert_eq!(property.property().name.item(), "prop");
+        assert!(rnode.get_property("prop").is_some());
+
+        // whitespace inside the inner node body, outside every property span —
+        // where typing a new property actually happens
+        assert!(matches!(
+            project.completion_context_at(&main, &Position::new(4, 2)),
+            Some(CompletionContext::InNode(_))
+        ));
+    }
+
+    #[test]
+    pub fn completion_context_merges_overlays_across_files() {
+        use crate::dts::Position;
+        use crate::dts::CompletionContext;
+        let temp_dir = TempDir::new();
+        let (_, base) = temp_dir.add_file(
+            "base.dts",
+            r#"/dts-v1/;
+/ {
+	base: node {
+		compatible = "vendor,gpio";
+	};
+};"#,
+        );
+        let _ = base;
+        let (_, overlay) = temp_dir.add_file(
+            "overlay.dts",
+            r#"/dts-v1/;
+#include "base.dts"
+&base {
+	extra = <1>;
+};"#,
+        );
+
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        project
+            .add_file(overlay.clone().into_os_string().into_string().unwrap(), &mut loader)
+            .expect("Cannot add file");
+
+        // typing inside the `&base { }` body of the overlay resolves to the
+        // MERGED node: the base's compatible (which powers binding lookup)
+        // is visible alongside the overlay's own property
+        let Some(CompletionContext::InNode(rnode)) =
+            project.completion_context_at(&overlay, &Position::new(3, 0))
+        else {
+            panic!("expected InNode inside the overlay body")
+        };
+        assert!(rnode.get_property("compatible").is_some());
+        assert!(rnode.get_property("extra").is_some());
     }
 
     #[test]

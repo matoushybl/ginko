@@ -1,5 +1,5 @@
 use crate::dts::ast::{AbsolutePath, NodeName, Property};
-use crate::dts::{HasSpan, Node, Span};
+use crate::dts::{HasSpan, Node, Position, Span};
 use std::collections::btree_map::Entry::{Occupied, Vacant};
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -33,6 +33,18 @@ impl Location {
 pub enum ResolvedContext<'a> {
     Node(&'a ResolvedNode),
     Property(&'a ResolvedProperty),
+}
+
+/// What a completion at a position is inside. Unlike [`ResolvedContext`],
+/// the enclosing node is found via span geometry rather than a `&ref` under
+/// the cursor, so completion works while typing inside node bodies.
+pub enum CompletionContext<'a> {
+    InNode(&'a ResolvedNode),
+    /// Cursor inside an existing property definition — property names make
+    /// no sense there; value completion is a later phase.
+    InProperty(&'a ResolvedNode, &'a ResolvedProperty),
+    /// Cursor outside any node — e.g. between top-level elements.
+    TopLevel,
 }
 
 pub struct ResolvedProperty {
@@ -96,6 +108,24 @@ impl ResolvedNode {
     pub fn sources<'a>(&'a self) -> impl Iterator<Item = &'a Location> + use<'a> {
         self.sources.iter().filter(|location| !location.deleted)
     }
+
+    /// The property of this node whose definition in `file` spans `position`.
+    pub fn property_at_position(
+        &self,
+        file: &Path,
+        position: &Position,
+    ) -> Option<&ResolvedProperty> {
+        self.properties
+            .values()
+            .filter(|property| !property.deleted)
+            .find(|property| {
+                property.sources.iter().any(|location| {
+                    !location.deleted
+                        && location.file() == file
+                        && location.span().contains(position)
+                })
+            })
+    }
 }
 
 impl ResolvedProperty {
@@ -111,6 +141,39 @@ pub struct ResolvedTree {
 }
 
 impl ResolvedTree {
+    /// The deepest node whose definition in `file` spans `position` — the node
+    /// a cursor at `position` is being written into. Node sources carry one
+    /// span per defining file (base and overlay definitions), so this works
+    /// for both. Children are tried first: a parent's span contains its
+    /// children's.
+    pub fn node_at_position(
+        &self,
+        file: &Path,
+        position: &Position,
+    ) -> Option<&ResolvedNode> {
+        fn walk<'a>(
+            node: &'a ResolvedNode,
+            file: &Path,
+            position: &Position,
+        ) -> Option<&'a ResolvedNode> {
+            if node.deleted {
+                return None;
+            }
+            for child in node.children.values() {
+                if let Some(found) = walk(child, file, position) {
+                    return Some(found);
+                }
+            }
+            node.sources.iter().any(|location| {
+                !location.deleted
+                    && location.file() == file
+                    && location.span().contains(position)
+            })
+            .then_some(node)
+        }
+        walk(&self.root, file, position)
+    }
+
     pub(crate) fn add_node(&mut self, path: &AbsolutePath, node: Arc<Node>, source: Arc<Path>) {
         let mut rnode = &mut self.root;
         for element in path.iter() {
@@ -123,6 +186,28 @@ impl ResolvedTree {
             }
         }
         rnode.sources.push(Location::new(source, node.span));
+        rnode.deleted = false;
+    }
+
+    /// Register a node definition's source span without (re-)adding node
+    /// content — used for `&ref { … }` overlay elements, whose payload
+    /// merges into the referenced node: without this, the overlay file stays
+    /// out of the node's sources and span-based lookups inside the overlay
+    /// body find no enclosing node.
+    pub(crate) fn add_node_span(
+        &mut self,
+        path: &AbsolutePath,
+        span: Span,
+        source: Arc<Path>,
+    ) {
+        let mut rnode = &mut self.root;
+        for element in path.iter() {
+            rnode = match rnode.children.entry(element.clone()) {
+                Occupied(entry) => entry.into_mut(),
+                Vacant(entry) => entry.insert(ResolvedNode::default()),
+            };
+        }
+        rnode.sources.push(Location::new(source, span));
         rnode.deleted = false;
     }
 
