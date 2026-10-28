@@ -43,6 +43,11 @@ pub struct PropertyHint {
     pub description: Option<String>,
     /// The binding marked this property `deprecated: true`.
     pub deprecated: bool,
+    /// The property's candidate values: strings collected from `enum:`
+    /// lists and `const:` entries of the property's sub-schema. A natural
+    /// special case: a node's own `compatible` candidates are the values of
+    /// its `compatible` property.
+    pub values: Vec<String>,
 }
 
 /// Indexed data distilled from a set of binding roots.
@@ -92,6 +97,11 @@ impl Bindings {
                     entry.required |= hint.required;
                     entry.boolean |= hint.boolean;
                     entry.deprecated |= hint.deprecated;
+                    for value in &hint.values {
+                        if !entry.values.contains(value) {
+                            entry.values.push(value.clone());
+                        }
+                    }
                     if entry.type_hint.is_none() {
                         entry.type_hint = hint.type_hint.clone();
                     }
@@ -231,12 +241,15 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
     let type_hint = sub.get("$ref").and_then(Value::as_str).and_then(type_ref_tail);
     let description = sub.get("description").and_then(Value::as_str).map(str::to_string);
     let deprecated = matches!(sub.get("deprecated"), Some(Value::Bool(true)));
+    let mut values = Vec::new();
+    collect_value_strings(sub, &mut values);
     PropertyHint {
         required,
         boolean: false,
         type_hint,
         description,
         deprecated,
+        values,
     }
 }
 
@@ -244,6 +257,43 @@ fn type_ref_tail(reference: &str) -> Option<String> {
     reference
         .rsplit_once("types.yaml#/definitions/")
         .map(|(_, tail)| tail.to_string())
+}
+
+/// Collect the candidate values of a property sub-schema: strings under
+/// `enum:` lists and `const:` entries. Nested child-node property maps
+/// (`properties`, `patternProperties`) and `examples` are not descended
+/// into — those enums belong to other properties.
+fn collect_value_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Mapping(map) => {
+            for (key, val) in map.iter() {
+                match key.as_str() {
+                    Some("enum") => {
+                        if let Value::Sequence(items) = val {
+                            for item in items {
+                                if let Some(string) = item.as_str() {
+                                    out.push(string.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Some("const") => {
+                        if let Some(string) = val.as_str() {
+                            out.push(string.to_string());
+                        }
+                    }
+                    Some("properties" | "patternProperties" | "examples") => {}
+                    _ => collect_value_strings(val, out),
+                }
+            }
+        }
+        Value::Sequence(items) => {
+            for item in items {
+                collect_value_strings(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively collect `*.yaml` files below `path`. A file passed directly is
@@ -412,6 +462,66 @@ properties:
 
         assert_eq!(bindings.schema_count(), 0);
         assert!(bindings.properties_for(&["whatever".to_string()]).is_empty());
+    }
+
+    const VALUES_BINDING: &str = r#"
+properties:
+  compatible:
+    oneOf:
+      - const: vendor,dev
+      - items:
+          - enum:
+              - vendor,dev2
+          - const: vendor,dev
+  mode:
+    description: the device mode
+    enum:
+      - host
+      - peripheral
+      - otg
+  clock-names:
+    items:
+      - const: ipg
+      - const: per
+  ports:
+    description: demonstrates child-subschema skipping
+    properties:
+      port:
+        type: object
+        properties:
+          endpoint:
+            enum: [ child-value ]
+"#;
+
+    #[test]
+    pub fn property_values_collect_enums_and_consts() {
+        let binding: Value = serde_yaml::from_str(VALUES_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("vendor/dev.yaml"), &binding);
+
+        let properties = bindings.properties_for(&["vendor,dev".to_string()]);
+
+        let mode = &properties["mode"];
+        assert_eq!(
+            mode.values,
+            vec![
+                "host".to_string(),
+                "peripheral".to_string(),
+                "otg".to_string(),
+            ]
+        );
+
+        let clock_names = &properties["clock-names"];
+        assert_eq!(clock_names.values, vec!["ipg".to_string(), "per".to_string()]);
+
+        // the compatible property's values are the schema's candidate strings
+        let compatible = &properties["compatible"];
+        assert!(compatible.values.contains(&"vendor,dev".to_string()));
+        assert!(compatible.values.contains(&"vendor,dev2".to_string()));
+
+        // child-node property schemas are not descended into
+        let ports = &properties["ports"];
+        assert!(ports.values.is_empty());
     }
 
     #[test]

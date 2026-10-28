@@ -1,8 +1,8 @@
 use ginko::dts::{
     AnyDirective, Bindings, CompletionContext, FileType, HasSpan, IncludeLoader,
     IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload,
-    ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, Severity, SeverityMap, Span,
-    node_compatibles,
+    ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, ResolvedProperty, Severity,
+    SeverityMap, Span, node_compatibles,
 };
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -417,6 +417,43 @@ impl LanguageServer for Backend {
             Some(CompletionResponse::Array(items))
         }
 
+        fn completions_for_property_values(
+            rnode: &ResolvedNode,
+            property: &ResolvedProperty,
+            bindings: &Bindings,
+        ) -> Option<CompletionResponse> {
+            let name = property.property().name.item();
+            let candidates = bindings
+                .properties_for(&node_compatibles(rnode))
+                .get(name)?
+                .values
+                .iter()
+                .map(|value| CompletionItem {
+                    label: value.clone(),
+                    detail: Some(format!("{name} value")),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            (!candidates.is_empty()).then_some(CompletionResponse::Array(candidates))
+        }
+
+        fn property_value_completion(
+            this: &Backend,
+            project: &Project,
+            file_path: &Path,
+            pos: &ginko::dts::Position,
+        ) -> Option<CompletionResponse> {
+            match project.completion_context_at(file_path, pos)? {
+                CompletionContext::InProperty(rnode, property)
+                    if *pos >= property.property().name.span().end() =>
+                {
+                    completions_for_property_values(rnode, property, &this.bindings)
+                }
+                _ => None,
+            }
+        }
+
         fn completions_for_root() -> Option<CompletionResponse> {
             let mut items = vec![];
             let snippet = " {\n\t$0\n};".to_string();
@@ -458,6 +495,13 @@ impl LanguageServer for Backend {
                 if let Some(token) = token.strip_prefix('&') {
                     return Ok(completions_for_reference(&project, &file_path, token));
                 }
+                // Positions inside a property span resolve to `Property` here;
+                // binding-aware value completion rides the span-based context.
+                if let Some(response) =
+                    property_value_completion(self, &project, &file_path, &pos)
+                {
+                    return Ok(Some(response));
+                }
             }
             None => {
                 if let Some(token) = token.strip_prefix('&') {
@@ -476,14 +520,19 @@ impl LanguageServer for Backend {
                 // No `&ref` context — fall back to span-based resolution of
                 // the node the cursor is inside (mid-payload completion).
                 match project.completion_context_at(&file_path, &pos) {
-                    // The cursor is inside a node body with no `&ref` under it:
-                    // complete the node — including binding-derived properties.
                     Some(CompletionContext::InNode(rnode)) => {
                         return Ok(completions_for_node(rnode, &self.bindings))
                     }
-                    // Inside an existing property: property names make no
-                    // sense there. Value completion is a later phase.
-                    Some(CompletionContext::InProperty(..)) => {}
+                    // Property-span positions that the reference-based
+                    // context missed (e.g. inside values) complete values
+                    // once past the property's name.
+                    Some(CompletionContext::InProperty(..)) => {
+                        if let Some(response) =
+                            property_value_completion(self, &project, &file_path, &pos)
+                        {
+                            return Ok(Some(response));
+                        }
+                    }
                     Some(CompletionContext::TopLevel) | None => {}
                 }
             }
