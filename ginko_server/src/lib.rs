@@ -4,11 +4,15 @@ use ginko::dts::{
     ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, ResolvedProperty, Severity,
     SeverityMap, Span, node_compatibles,
 };
+use ginko::header::{Define, TokenKind, parse_header};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::request::GotoImplementationParams;
 use tower_lsp::lsp_types::*;
@@ -22,6 +26,8 @@ pub struct Backend {
     severities: SeverityMap,
     loader: RwLock<IncludeLoaderGuard>,
     bindings: Bindings,
+    include_paths: Vec<PathBuf>,
+    header_define_cache: RwLock<HashMap<PathBuf, Arc<Vec<Define>>>>,
 }
 
 impl Backend {
@@ -33,6 +39,8 @@ impl Backend {
             severities: SeverityMap::default(),
             loader: RwLock::new(IncludeLoaderGuard::default()),
             bindings: Bindings::default(),
+            include_paths: Vec::new(),
+            header_define_cache: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -79,8 +87,9 @@ impl Backend {
     /// Configure the include search paths (the `-i/--include` values passed
     /// to the binary). Without this, CLI-provided paths never reach the
     /// project's include loader.
-    pub fn with_include_paths(self, include_paths: Vec<String>) -> Self {
-        self.loader.write().set_include_paths(include_paths);
+    pub fn with_include_paths(mut self, include_paths: Vec<String>) -> Self {
+        self.loader.write().set_include_paths(include_paths.clone());
+        self.include_paths = include_paths.iter().map(PathBuf::from).collect();
         self
     }
 
@@ -95,6 +104,33 @@ impl Backend {
             self.bindings.compatible_count()
         );
         self
+    }
+
+    /// Resolve a relative header path named by a binding description (e.g.
+    /// `include/dt-bindings/leds/common.h`) under the configured include
+    /// paths and scan it once for `#define`s. The scanned defines are cached
+    /// per resolved file for the session.
+    fn header_defines(&self, relative: &str) -> Option<Arc<Vec<Define>>> {
+        let resolved = self.include_paths.iter().find_map(|root| {
+            let direct = root.join(relative);
+            let stripped = relative
+                .strip_prefix("include/")
+                .map(|rest| root.join(rest));
+            std::iter::once(&direct)
+                .chain(stripped.iter())
+                .find(|candidate| candidate.exists())
+                .cloned()
+        })?;
+        if let Some(defines) = self.header_define_cache.read().get(&resolved) {
+            return Some(defines.clone());
+        }
+        let text = fs::read_to_string(&resolved).ok()?;
+        let source = Arc::from(resolved.as_path());
+        let defines = Arc::new(parse_header(&text, source).defines);
+        self.header_define_cache
+            .write()
+            .insert(resolved, defines.clone());
+        Some(defines)
     }
 
     pub fn with_parser_config(self, config: ParserConfig) -> Self {
@@ -418,31 +454,59 @@ impl LanguageServer for Backend {
         }
 
         fn completions_for_property_values(
+            this: &Backend,
             rnode: &ResolvedNode,
             property: &ResolvedProperty,
             bindings: &Bindings,
         ) -> Option<CompletionResponse> {
             let name = property.property().name.item();
             let properties = bindings.properties_for(&node_compatibles(rnode));
-            let mut sources: Vec<&[String]> = properties
-                .get(name)
-                .map(|hint| hint.values.as_slice())
-                .into_iter()
-                .collect();
-            if sources.first().is_none_or(|values| values.is_empty()) {
-                sources.push(bindings.common_values(name));
-            }
-            let candidates = sources
+            let matched = properties.get(name);
+            let yaml_values: &[String] = match matched.map(|hint| &hint.values) {
+                Some(values) if !values.is_empty() => values,
+                _ => bindings.common_values(name),
+            };
+            let mut items: Vec<CompletionItem> = yaml_values
                 .iter()
-                .flat_map(|values| values.iter())
                 .map(|value| CompletionItem {
                     label: value.clone(),
                     detail: Some(format!("{name} value")),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
                     ..Default::default()
                 })
-                .collect::<Vec<_>>();
-            (!candidates.is_empty()).then_some(CompletionResponse::Array(candidates))
+                .collect();
+            let mut define_prefixes: BTreeMap<&str, &str> = BTreeMap::new();
+            for hint in matched.into_iter().chain(bindings.common_hint(name)) {
+                for (prefix, header) in &hint.define_families {
+                    define_prefixes
+                        .entry(prefix.as_str())
+                        .or_insert(header.as_str());
+                }
+            }
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for (prefix, header) in define_prefixes {
+                let Some(defines) = this.header_defines(header) else {
+                    continue;
+                };
+                for define in defines.iter() {
+                    if define.fn_like {
+                        continue;
+                    }
+                    let TokenKind::Ident(label) = &define.name.kind else {
+                        continue;
+                    };
+                    if !label.starts_with(prefix) || !seen.insert(label.clone()) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: label.clone(),
+                        detail: Some(format!("{} ({header})", define.body)),
+                        kind: Some(CompletionItemKind::CONSTANT),
+                        ..Default::default()
+                    });
+                }
+            }
+            (!items.is_empty()).then_some(CompletionResponse::Array(items))
         }
 
         fn property_value_completion(
@@ -455,7 +519,7 @@ impl LanguageServer for Backend {
                 CompletionContext::InProperty(rnode, property)
                     if *pos >= property.property().name.span().end() =>
                 {
-                    completions_for_property_values(rnode, property, &this.bindings)
+                    completions_for_property_values(this, rnode, property, &this.bindings)
                 }
                 _ => None,
             }

@@ -48,6 +48,10 @@ pub struct PropertyHint {
     /// special case: a node's own `compatible` candidates are the values of
     /// its `compatible` property.
     pub values: Vec<String>,
+    /// Define-prefix families referenced by the description ("Use one of
+    /// the LED_COLOR_ID_* prefixed definitions …"), mapped to the relative
+    /// header path that defines them.
+    pub define_families: BTreeMap<String, String>,
 }
 
 /// Indexed data distilled from a set of binding roots.
@@ -113,6 +117,12 @@ impl Bindings {
                     if entry.description.is_none() {
                         entry.description = hint.description.clone();
                     }
+                    for (prefix, header) in &hint.define_families {
+                        entry
+                            .define_families
+                            .entry(prefix.clone())
+                            .or_insert_with(|| header.clone());
+                    }
                 }
             }
         }
@@ -166,6 +176,9 @@ impl Bindings {
             entry.required |= hint.required;
             entry.boolean |= hint.boolean;
             entry.deprecated |= hint.deprecated;
+            for (prefix, header) in hint.define_families {
+                entry.define_families.entry(prefix).or_insert(header);
+            }
             for value in hint.values {
                 if !entry.values.contains(&value) {
                     entry.values.push(value);
@@ -189,6 +202,13 @@ impl Bindings {
             .get(name)
             .map(|hint| hint.values.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The common-part hint for a property — the merge of all
+    /// compatible-less binding files that mention it (e.g. `color` from
+    /// leds/common.yaml).
+    pub fn common_hint(&self, name: &str) -> Option<&PropertyHint> {
+        self.common.get(name)
     }
 }
 
@@ -289,6 +309,7 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
     let type_hint = sub.get("$ref").and_then(Value::as_str).and_then(type_ref_tail);
     let description = sub.get("description").and_then(Value::as_str).map(str::to_string);
     let deprecated = matches!(sub.get("deprecated"), Some(Value::Bool(true)));
+    let define_families = define_families_from(description.as_deref());
     let mut values = Vec::new();
     collect_value_strings(sub, &mut values);
     PropertyHint {
@@ -298,7 +319,53 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
         description,
         deprecated,
         values,
+        define_families,
     }
+}
+
+/// Bindings prose convention: "Use one of the LED_COLOR_ID_* prefixed
+/// definitions from the header include/dt-bindings/leds/common.h." Extract
+/// the uppercase `_`-suffixed token(s) starred via `*` in such descriptions
+/// and map each family prefix to the first `include/…h` path mention;
+/// descriptions without a header mention yield nothing.
+fn define_families_from(description: Option<&str>) -> BTreeMap<String, String> {
+    let Some(description) = description else {
+        return BTreeMap::new();
+    };
+    let Some(start) = description.find("include/") else {
+        return BTreeMap::new();
+    };
+    let rest = &description[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let header = rest[..end]
+        .trim_end_matches(|c| c == '.' || c == ',' || c == ';')
+        .to_string();
+    if !header.ends_with(".h") || header == ".h" {
+        return BTreeMap::new();
+    }
+    let bytes = description.as_bytes();
+    let mut families = BTreeMap::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_uppercase() {
+            let start = i;
+            i += 1;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_uppercase()
+                    || bytes[i].is_ascii_digit()
+                    || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let token = &description[start..i];
+            if i < bytes.len() && bytes[i] == b'*' && token.ends_with('_') {
+                families.insert(token.to_string(), header.clone());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    families
 }
 
 fn type_ref_tail(reference: &str) -> Option<String> {
@@ -598,6 +665,61 @@ properties:
             vec!["okay".to_string(), "disabled".to_string()]
         );
         assert!(bindings.common_values("shared-thing").is_empty());
+    }
+
+    #[test]
+    pub fn define_families_bind_prefixes_to_header_mentions() {
+        let color_desc = "Color of the LED. Use one of the LED_COLOR_ID_* \
+prefixed definitions from the header include/dt-bindings/leds/common.h. If \
+there is no matching LED_COLOR_ID available, add a new one.";
+
+        let families = define_families_from(Some(color_desc));
+        // `LED_COLOR_ID` without the `_*` star is not a family
+        assert_eq!(families.len(), 1);
+        assert_eq!(
+            families.get("LED_COLOR_ID_").map(String::as_str),
+            Some("include/dt-bindings/leds/common.h")
+        );
+
+        assert!(define_families_from(Some("a plain description")).is_empty());
+        assert!(define_families_from(Some("mentions LED_COLOR_ID_* but no header")).is_empty());
+        assert!(define_families_from(None).is_empty());
+    }
+
+    #[test]
+    pub fn common_and_matched_hints_carry_define_families() {
+        const MATCHED_LED: &str = r#"
+properties:
+  compatible:
+    const: vendor,led
+  color:
+    description: Use one of the LED_COLOR_ID_* prefixed definitions from the header include/dt-bindings/leds/common.h.
+"#;
+        const COMMON_LED: &str = r#"
+properties:
+  color:
+    description: Use one of the LED_COLOR_ID_* prefixed definitions from the header include/dt-bindings/leds/common.h.
+  function:
+    description: Use one of the LED_FUNCTION_* prefixed definitions from the header include/dt-bindings/leds/common.h.
+"#;
+        let mut bindings = Bindings::default();
+        let matched_yaml: Value = serde_yaml::from_str(MATCHED_LED).unwrap();
+        bindings.add_schema(PathBuf::from("leds/vendor-led.yaml"), &matched_yaml);
+        let common_yaml: Value = serde_yaml::from_str(COMMON_LED).unwrap();
+        bindings.add_schema(PathBuf::from("leds/common.yaml"), &common_yaml);
+
+        let matched = bindings.properties_for(&["vendor,led".to_string()]);
+        assert_eq!(
+            matched["color"]
+                .define_families
+                .get("LED_COLOR_ID_")
+                .map(String::as_str),
+            Some("include/dt-bindings/leds/common.h")
+        );
+
+        let function = bindings.common_hint("function").unwrap();
+        assert!(function.define_families.contains_key("LED_FUNCTION_"));
+        assert!(bindings.common_hint("color").is_some());
     }
 
     #[test]
