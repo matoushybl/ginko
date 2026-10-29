@@ -166,7 +166,12 @@ impl Project {
         if let Some(f) = self.canonicalizer {
             f(path.as_ref())
         } else {
-            self::fs::canonicalize(path)
+            // A file not (yet) on disk — e.g. a fresh unsaved editor buffer —
+            // cannot be canonicalized, but its spelled path is a stable
+            // identity: fall back to it so the whole add/lookup funnel keeps
+            // working for new files instead of erroring or panicking.
+            self::fs::canonicalize(path.as_ref())
+                .or_else(|_| Ok(path.as_ref().to_path_buf()))
         }
     }
 
@@ -1406,5 +1411,31 @@ mod tests {
             .expect("Cannot add file");
 
         assert!(project.get_analysis(&link).is_some());
+    }
+
+    #[test]
+    pub fn unsaved_new_buffer_is_added_without_panicking() {
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let missing = std::env::temp_dir().join(format!("ginko-never-{}.dts", std::process::id()));
+        assert!(!missing.exists());
+
+        project.add_file_with_text(
+            missing.clone(),
+            "/dts-v1/;\n\n/ {\n\tled_status: node3722 {\n\t\tcompatible = \"unipi,zulu\";\n\t};\n};\n"
+                .to_string(),
+            crate::dts::data::FileType::from(missing.as_path()),
+            &mut loader,
+        );
+
+        // the spelled path is the file's identity; adding does not panic and
+        // the usual lookup funnel answers for it like for any disk file
+        assert!(project.get_file(&missing).is_some());
+        assert!(project.get_analysis(&missing).is_some());
+        let Some(crate::dts::CompletionContext::InProperty(..)) =
+            project.completion_context_at(&missing, &crate::dts::Position::new(4, 8))
+        else {
+            panic!("expected InProperty at the compatible property");
+        };
     }
 }
