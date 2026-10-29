@@ -678,6 +678,12 @@ impl Project {
             Err(_) => None,
         }
     }
+
+    /// The current text of a project file — the last didOpen/didChange
+    /// content as ingested, not re-read from disk.
+    pub fn file_source(&self, path: &Path) -> Option<&str> {
+        self.get_file(path).map(|file| file.source.as_str())
+    }
 }
 
 #[cfg(test)]

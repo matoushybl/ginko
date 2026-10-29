@@ -455,6 +455,8 @@ impl LanguageServer for Backend {
 
         fn completions_for_property_values(
             this: &Backend,
+            project: &Project,
+            file_path: &Path,
             rnode: &ResolvedNode,
             property: &ResolvedProperty,
             bindings: &Bindings,
@@ -488,6 +490,24 @@ impl LanguageServer for Backend {
                 let Some(defines) = this.header_defines(header) else {
                     continue;
                 };
+                // A representative candidate decides whether the family's
+                // defines are already in scope for this file's include
+                // chain; if not, accepting any item of the family also adds
+                // the binding-named #include.
+                let representative = defines.iter().find_map(|define| {
+                    let TokenKind::Ident(label) = &define.name.kind else {
+                        return None;
+                    };
+                    (!define.fn_like && label.starts_with(prefix)).then(|| label.clone())
+                });
+                let include_edit = representative.and_then(|representative| {
+                    additional_include_edit(
+                        project,
+                        file_path,
+                        &representative,
+                        &dts_include_path(header),
+                    )
+                });
                 for define in defines.iter() {
                     if define.fn_like {
                         continue;
@@ -502,11 +522,66 @@ impl LanguageServer for Backend {
                         label: label.clone(),
                         detail: Some(format!("{} ({header})", define.body)),
                         kind: Some(CompletionItemKind::CONSTANT),
+                        additional_text_edits: include_edit.clone().map(|edit| vec![edit]),
                         ..Default::default()
                     });
                 }
             }
             (!items.is_empty()).then_some(CompletionResponse::Array(items))
+        }
+
+        /// The DTS spelling of a binding-relative header path: strip the
+        /// leading `include/` — `#include <dt-bindings/…>` resolves against
+        /// the `--include` roots.
+        fn dts_include_path(relative: &str) -> String {
+            relative
+                .strip_prefix("include/")
+            .unwrap_or(relative)
+                .to_string()
+        }
+
+        /// The `#include <…>` TextEdit to attach to header-define completion
+        /// items when the family's defines are not yet in scope for the
+        /// completed file. None when an already-included header (directly or
+        /// transitively) provides the defines.
+        fn additional_include_edit(
+            project: &Project,
+            file_path: &Path,
+            representative_define: &str,
+            include_path: &str,
+        ) -> Option<TextEdit> {
+            if project
+                .get_analysis(file_path)
+                .and_then(|analysis| analysis.get_define(representative_define))
+                .is_some()
+            {
+                return None;
+            }
+            let source = project.file_source(file_path)?;
+            let line = include_insert_line(source);
+            Some(TextEdit {
+                range: Range::new(Position::new(line, 0), Position::new(line, 0)),
+                new_text: format!("#include <{include_path}>\n"),
+            })
+        }
+
+        /// Insert the new `#include` after the last existing one, else after
+        /// the `/dts-v1/;` directive, else at the top of the file.
+        fn include_insert_line(source: &str) -> u32 {
+            let mut last_include: Option<u32> = None;
+            let mut dts_v1_line: Option<u32> = None;
+            for (i, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("#include") {
+                    last_include = Some(i as u32);
+                } else if dts_v1_line.is_none() && trimmed.starts_with("/dts-v1/") {
+                    dts_v1_line = Some(i as u32);
+                }
+            }
+            last_include
+                .or(dts_v1_line)
+                .map(|line| line + 1)
+                .unwrap_or(0)
         }
 
         fn property_value_completion(
@@ -519,7 +594,14 @@ impl LanguageServer for Backend {
                 CompletionContext::InProperty(rnode, property)
                     if *pos >= property.property().name.span().end() =>
                 {
-                    completions_for_property_values(this, rnode, property, &this.bindings)
+                    completions_for_property_values(
+                        this,
+                        project,
+                        file_path,
+                        rnode,
+                        property,
+                        &this.bindings,
+                    )
                 }
                 _ => None,
             }
