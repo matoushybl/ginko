@@ -529,6 +529,12 @@ impl Project {
         let line = file.source.lines().nth(position.line() as usize)?;
         let mut token = String::new();
 
+        // Nothing typed before the cursor on this line: the token is empty.
+        // Also guards the `character - 1` below, which would underflow at 0.
+        if position.character() == 0 {
+            return Some(token);
+        }
+
         for (i, c) in line.chars().enumerate() {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '?' || c == '&'
             {
@@ -1411,6 +1417,69 @@ mod tests {
             .expect("Cannot add file");
 
         assert!(project.get_analysis(&link).is_some());
+    }
+
+    #[test]
+    pub fn token_at_handles_column_zero_and_boundaries() {
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let text = "/dts-v1/;\n/ {\n\treg@1000 {\n\t\tcompatible = \"vendor,device\";\n\t};\n};\n";
+        let temp_dir = TempDir::new();
+        let (_, path) = temp_dir.add_file("test.dts", text);
+        project
+            .add_file(path.display().to_string(), &mut loader)
+            .expect("Cannot add file");
+
+        let compatible_line = 3usize; // `\t\tcompatible = "vendor,device";`
+        let line2 = text.lines().nth(compatible_line).unwrap();
+        let after_vendor = line2.find("vendor").unwrap() + "vendor".len();
+
+        // column 0: nothing typed before the cursor —
+        // used to underflow `character - 1`
+        assert_eq!(
+            project.token_at(&path, &crate::dts::Position::new(compatible_line as u32, 0)),
+            Some(String::new())
+        );
+        // mid-line behavior is unchanged
+        assert_eq!(
+            project.token_at(
+                &path,
+                &crate::dts::Position::new(compatible_line as u32, after_vendor as u32)
+            ),
+            Some("vendor".to_string())
+        );
+        // cursor past the end of the line: no token, as before
+        assert_eq!(
+            project.token_at(
+                &path,
+                &crate::dts::Position::new(compatible_line as u32, 200)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    pub fn blank_lines_inside_nodes_resolve_to_enclosing_context() {
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let text = "/dts-v1/;\n\n/ {\n\tblank_ctx {\n\t\tcompatible = \"vendor,device\";\n\n\t};\n};\n";
+        let temp_dir = TempDir::new();
+        let (_, path) = temp_dir.add_file("test.dts", text);
+        project
+            .add_file(path.display().to_string(), &mut loader)
+            .expect("Cannot add file");
+
+        // line 5 is the blank line inside the `blank_ctx` node
+        let pos = crate::dts::Position::new(5, 0);
+        let ctx = project
+            .completion_context_at(&path, &pos)
+            .expect("blank interior line must resolve to an enclosing context");
+        assert!(matches!(ctx, crate::dts::CompletionContext::InNode(_)));
+
+        let ref_ctx = project
+            .context_at(&path, &pos)
+            .expect("reference visitor must find the enclosing node for blank positions");
+        assert!(matches!(ref_ctx, crate::dts::ResolvedContext::Node(_)));
     }
 
     #[test]
