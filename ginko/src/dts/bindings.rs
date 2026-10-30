@@ -152,6 +152,14 @@ impl Bindings {
         compatibles.sort();
         compatibles.dedup();
         if compatibles.is_empty() {
+            // dt-schema `select: true` schemas (its `dt-core.yaml`) apply to
+            // every node despite a pattern-only `compatible`: their property
+            // enums (status, ...) are global value candidates. Pattern-only
+            // schemas without `select: true` only match on their pattern —
+            // they stay unused, as before.
+            if matches!(binding.get("select"), Some(Value::Bool(true))) {
+                self.add_common_schema(binding);
+            }
             return;
         }
         let properties = extract_properties(binding);
@@ -209,6 +217,13 @@ impl Bindings {
     /// leds/common.yaml).
     pub fn common_hint(&self, name: &str) -> Option<&PropertyHint> {
         self.common.get(name)
+    }
+
+    /// The number of distinct property names contributed by common-part
+    /// and `select: true` schemas — the audit metric for which shared files
+    /// feed value completion.
+    pub fn common_prop_count(&self) -> usize {
+        self.common.len()
     }
 }
 
@@ -720,6 +735,51 @@ properties:
         let function = bindings.common_hint("function").unwrap();
         assert!(function.define_families.contains_key("LED_FUNCTION_"));
         assert!(bindings.common_hint("color").is_some());
+    }
+
+    #[test]
+    pub fn select_true_pattern_only_schemas_are_common() {
+        const DT_CORE: &str = r#"
+select: true
+properties:
+  compatible:
+    $ref: types.yaml#/definitions/string-array
+  status:
+    oneOf:
+      - type: object
+      - $ref: types.yaml#/definitions/string
+        enum: [ okay, disabled, reserved, fail, fail-needs-probe ]
+"#;
+        const PATTERN_ONLY: &str = r#"
+properties:
+  compatible:
+    $ref: types.yaml#/definitions/string-array
+  status:
+    enum: [ okay, disabled ]
+"#;
+
+        let mut bindings = Bindings::default();
+        let core: Value = serde_yaml::from_str(DT_CORE).unwrap();
+        bindings.add_schema(PathBuf::from("dt-core.yaml"), &core);
+        assert_eq!(bindings.schema_count(), 0);
+        assert_eq!(
+            bindings.common_values("status").to_vec(),
+            vec![
+                "okay".to_string(),
+                "disabled".to_string(),
+                "reserved".to_string(),
+                "fail".to_string(),
+                "fail-needs-probe".to_string(),
+            ]
+        );
+
+        // pattern-only without `select: true` matches on its pattern only —
+        // it must not contribute common candidates (as before)
+        let mut bindings = Bindings::default();
+        let pattern_only: Value = serde_yaml::from_str(PATTERN_ONLY).unwrap();
+        bindings.add_schema(PathBuf::from("serial.yaml"), &pattern_only);
+        assert_eq!(bindings.schema_count(), 0);
+        assert!(bindings.common_values("status").is_empty());
     }
 
     #[test]
