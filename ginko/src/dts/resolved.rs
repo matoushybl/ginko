@@ -151,27 +151,63 @@ impl ResolvedTree {
         file: &Path,
         position: &Position,
     ) -> Option<&ResolvedNode> {
+        self.node_and_path_at_position(file, position)
+            .map(|(node, _)| node)
+    }
+
+    /// The resolved node at the position with the trail of node names
+    /// leading to it (top-level node first, the node's own full name —
+    /// including its unit address — last).
+    pub fn node_and_path_at_position(
+        &self,
+        file: &Path,
+        position: &Position,
+    ) -> Option<(&ResolvedNode, Vec<String>)> {
         fn walk<'a>(
             node: &'a ResolvedNode,
             file: &Path,
             position: &Position,
+            trail: &mut Vec<String>,
         ) -> Option<&'a ResolvedNode> {
             if node.deleted {
                 return None;
             }
-            for child in node.children.values() {
-                if let Some(found) = walk(child, file, position) {
+            for (name, child) in &node.children {
+                trail.push(match &name.unit_address {
+                    Some(address) => format!("{}@{}", name.name, address),
+                    None => name.name.clone(),
+                });
+                if let Some(found) = walk(child, file, position, trail) {
                     return Some(found);
                 }
+                trail.pop();
             }
-            node.sources.iter().any(|location| {
-                !location.deleted
-                    && location.file() == file
-                    && location.span().contains(position)
-            })
-            .then_some(node)
+            node.sources
+                .iter()
+                .any(|location| {
+                    !location.deleted
+                        && location.file() == file
+                        && location.span().contains(position)
+                })
+                .then_some(node)
         }
-        walk(&self.root, file, position)
+        let mut trail = Vec::new();
+        let node = walk(&self.root, file, position, &mut trail)?;
+        Some((node, trail))
+    }
+
+    /// The resolved node at an absolute path of full node names, as
+    /// produced by [`ResolvedTree::node_and_path_at_position`]. The empty
+    /// path is the tree root.
+    pub fn node_at_path(&self, path: &[String]) -> Option<&ResolvedNode> {
+        let mut node = &self.root;
+        for segment in path {
+            node = node.children.get(&NodeName::from(segment.clone()))?;
+            if node.deleted {
+                return None;
+            }
+        }
+        Some(node)
     }
 
     pub(crate) fn add_node(&mut self, path: &AbsolutePath, node: Arc<Node>, source: Arc<Path>) {
@@ -242,12 +278,27 @@ impl ResolvedTree {
             rnode = rnode.children.get_mut(element).expect("proper tree");
         }
         let span = value.span();
-        let rprop = ResolvedProperty {
-            deleted: false,
-            inner: value,
-            sources: vec![Location::new(source, span)],
-        };
-        rnode.properties.insert(key.to_string(), rprop);
+        // A property can be defined in several files (base dtsi + `&ref { }`
+        // overlay): merge the new DEFINITION (its value wins, last added)
+        // while KEEPING every file's span — overwriting here used to drop the
+        // base side, making span-based property lookups (value completion,
+        // property_at_position) fail on the file not added last.
+        use std::collections::btree_map::Entry;
+        match rnode.properties.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.deleted = false;
+                existing.inner = value;
+                existing.sources.push(Location::new(source, span));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ResolvedProperty {
+                    deleted: false,
+                    inner: value,
+                    sources: vec![Location::new(source, span)],
+                });
+            }
+        }
     }
 
     pub(crate) fn delete_property(&mut self, parent_path: &AbsolutePath, name: &str) {

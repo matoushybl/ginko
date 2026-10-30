@@ -428,9 +428,30 @@ impl LanguageServer for Backend {
             ))
         }
 
+        /// Property hints for a compatible-less CHILD node keyed by its
+        /// parent's binding: the parent node of the position's enclosing
+        /// node supplies compatibles, its binding's `patternProperties`
+        /// supply the child schemas, keyed by the child's own node name.
+        fn child_binding_hints(
+            project: &Project,
+            file_path: &Path,
+            pos: &ginko::dts::Position,
+            bindings: &Bindings,
+        ) -> Option<BTreeMap<String, ginko::dts::PropertyHint>> {
+            let analysis = project.get_analysis(file_path)?;
+            let tree = analysis.get_resolved_tree();
+            let file = project.canonical_path(file_path);
+            let (_, trail) = tree.node_and_path_at_position(&file, pos)?;
+            let name = trail.last()?;
+            let parent = tree.node_at_path(&trail[..trail.len() - 1])?;
+            let hints = bindings.child_properties_for(&node_compatibles(parent), name);
+            (!hints.is_empty()).then_some(hints)
+        }
+
         fn completions_for_node(
             rnode: &ResolvedNode,
             bindings: &Bindings,
+            child_hints: Option<&BTreeMap<String, ginko::dts::PropertyHint>>,
         ) -> Option<CompletionResponse> {
             let mut items = vec![];
             for name in rnode.active_child_nodes() {
@@ -491,6 +512,41 @@ impl LanguageServer for Backend {
                 }
                 items.push(item);
             }
+            // Child-node binding hints: binding children keyed by the
+            // parent's `patternProperties` (pinctrl groups, LEDs, ...) share
+            // the own-binding item shape, at lower priority.
+            for (name, hint) in child_hints.into_iter().flatten() {
+                if items.iter().any(|item| item.label == *name) {
+                    continue;
+                }
+                let snippet = if hint.boolean {
+                    format!("{name};")
+                } else {
+                    format!("{name} = $0;")
+                };
+                let detail = if hint.required {
+                    "required property".to_string()
+                } else {
+                    hint.type_hint
+                        .clone()
+                        .unwrap_or_else(|| "property".to_string())
+                };
+                let mut item = CompletionItem {
+                    label: name.clone(),
+                    detail: Some(detail),
+                    kind: Some(CompletionItemKind::FIELD),
+                    insert_text: Some(snippet),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                };
+                if let Some(description) = hint.description.clone() {
+                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: description,
+                    }));
+                }
+                items.push(item);
+            }
             Some(CompletionResponse::Array(items))
         }
 
@@ -498,6 +554,7 @@ impl LanguageServer for Backend {
             this: &Backend,
             project: &Project,
             file_path: &Path,
+            pos: &ginko::dts::Position,
             rnode: &ResolvedNode,
             property: &ResolvedProperty,
             bindings: &Bindings,
@@ -505,10 +562,18 @@ impl LanguageServer for Backend {
             let name = property.property().name.item();
             let properties = bindings.properties_for(&node_compatibles(rnode));
             let matched = properties.get(name);
-            let yaml_values: &[String] = match matched.map(|hint| &hint.values) {
-                Some(values) if !values.is_empty() => values,
-                _ => bindings.common_values(name),
-            };
+            let child_hint = child_binding_hints(project, file_path, pos, bindings)
+                .and_then(|hints| hints.get(name).cloned());
+            let yaml_values: &[String] = matched
+                .filter(|hint| !hint.values.is_empty())
+                .map(|hint| &hint.values[..])
+                .or_else(|| {
+                    child_hint
+                        .as_ref()
+                        .filter(|hint| !hint.values.is_empty())
+                        .map(|hint| &hint.values[..])
+                })
+                .unwrap_or_else(|| bindings.common_values(name));
             let mut items: Vec<CompletionItem> = yaml_values
                 .iter()
                 .map(|value| CompletionItem {
@@ -519,7 +584,11 @@ impl LanguageServer for Backend {
                 })
                 .collect();
             let mut define_prefixes: BTreeMap<&str, &str> = BTreeMap::new();
-            for hint in matched.into_iter().chain(bindings.common_hint(name)) {
+            for hint in matched
+                .into_iter()
+                .chain(child_hint.as_ref())
+                .chain(bindings.common_hint(name))
+            {
                 for (prefix, header) in &hint.define_families {
                     define_prefixes
                         .entry(prefix.as_str())
@@ -639,6 +708,7 @@ impl LanguageServer for Backend {
                         this,
                         project,
                         file_path,
+                        pos,
                         rnode,
                         property,
                         &this.bindings,
@@ -683,7 +753,13 @@ impl LanguageServer for Backend {
                     return Ok(completions_for_reference(&project, &file_path, token));
                 }
 
-                return Ok(completions_for_node(rnode, &self.bindings));
+                let child_hints =
+                    child_binding_hints(&project, &file_path, &pos, &self.bindings);
+                return Ok(completions_for_node(
+                    rnode,
+                    &self.bindings,
+                    child_hints.as_ref(),
+                ));
             }
             Some(ResolvedContext::Property(_)) => {
                 if let Some(token) = token.strip_prefix('&') {
@@ -715,7 +791,11 @@ impl LanguageServer for Backend {
                 // the node the cursor is inside (mid-payload completion).
                 match project.completion_context_at(&file_path, &pos) {
                     Some(CompletionContext::InNode(rnode)) => {
-                        return Ok(completions_for_node(rnode, &self.bindings))
+                        return Ok(completions_for_node(
+                            rnode,
+                            &self.bindings,
+                            child_binding_hints(&project, &file_path, &pos, &self.bindings).as_ref(),
+                        ))
                     }
                     // Property-span positions that the reference-based
                     // context missed (e.g. inside values) complete values

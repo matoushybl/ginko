@@ -695,6 +695,12 @@ impl Project {
     pub fn file_source(&self, path: &Path) -> Option<&str> {
         self.get_file(path).map(|file| file.source.as_str())
     }
+
+    /// The project-internal identity of `path`: canonicalized, or the
+    /// spelled path when the file does not exist on disk (new buffers).
+    pub fn canonical_path(&self, path: &Path) -> PathBuf {
+        self.canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 #[cfg(test)]
@@ -1480,6 +1486,90 @@ mod tests {
             .context_at(&path, &pos)
             .expect("reference visitor must find the enclosing node for blank positions");
         assert!(matches!(ref_ctx, crate::dts::ResolvedContext::Node(_)));
+    }
+
+    #[test]
+    pub fn overlay_redefined_property_keeps_base_span() {
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let temp_dir = TempDir::new();
+        let base_text =
+            "/dts-v1/;\n\n/ {\n\tnode_l: node {\n\t\tcompatible = \"vendor,x\";\n\t\tvalue = <1>;\n\t};\n};\n";
+        let (_, base_path) = temp_dir.add_file("base.dtsi", base_text);
+        let overlay_text = "/dts-v1/;\n\n&node_l {\n\tvalue = <2>;\n};\n";
+        let (_, overlay_path) = temp_dir.add_file("overlay.dts", overlay_text);
+        project
+            .add_file(base_path.display().to_string(), &mut loader)
+            .expect("Cannot add base");
+        project
+            .add_file(overlay_path.display().to_string(), &mut loader)
+            .expect("Cannot add overlay");
+
+        let base_lines = base_text.lines().collect_vec();
+        let base_value_line = base_lines
+            .iter()
+            .position(|l| l.contains("value = <1>;"))
+            .unwrap() as u32;
+        let base_value_col = (base_lines[base_value_line as usize].find("<1").unwrap() + 1) as u32;
+
+        // the property is redefined by the overlay, but its BASE side span
+        // must survive the merge for span-based lookups
+        let ctx = project
+            .completion_context_at(
+                &base_path,
+                &crate::dts::Position::new(base_value_line, base_value_col),
+            )
+            .expect("base-side property span must resolve");
+        assert!(matches!(
+            ctx,
+            crate::dts::CompletionContext::InProperty(..)
+        ));
+
+        // and the overlay side still resolves, of course
+        let overlay_lines = overlay_text.lines().collect_vec();
+        let overlay_value_line = overlay_lines
+            .iter()
+            .position(|l| l.contains("value = <2>;"))
+            .unwrap() as u32;
+        let ctx = project
+            .completion_context_at(
+                &overlay_path,
+                &crate::dts::Position::new(overlay_value_line, 5),
+            )
+            .expect("overlay-side property span must resolve");
+        assert!(matches!(
+            ctx,
+            crate::dts::CompletionContext::InProperty(..)
+        ));
+    }
+
+    #[test]
+    pub fn node_trail_and_parent_lookup_for_children() {
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let text = "/dts-v1/;\n/ {\n\tbase: ctrl@1000 {\n\t\tcompatible = \"vendor,ctl\";\n\t\tchild_by_name {\n\t\t\tvalue = <2>;\n\t\t};\n\t};\n};\n";
+        let temp_dir = TempDir::new();
+        let (_, path) = temp_dir.add_file("test.dts", text);
+        project
+            .add_file(path.display().to_string(), &mut loader)
+            .expect("Cannot add file");
+
+        let analysis = project.get_analysis(&path).expect("analysis");
+        let tree = analysis.get_resolved_tree();
+        let (node, trail) = tree
+            .node_and_path_at_position(&path, &crate::dts::Position::new(5, 3))
+            .expect("node at child position");
+        // full names incl. unit addresses, own node name last
+        assert_eq!(trail, vec!["ctrl@1000".to_string(), "child_by_name".to_string()]);
+        assert!(node.get_property("value").is_some());
+
+        let parent = tree
+            .node_at_path(&trail[..trail.len() - 1])
+            .expect("parent node");
+        assert_eq!(
+            crate::dts::node_compatibles(parent),
+            vec!["vendor,ctl".to_string()]
+        );
     }
 
     #[test]

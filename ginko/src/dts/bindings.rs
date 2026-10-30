@@ -12,7 +12,7 @@
 //! a type hint, `select:`-driven bindings do not match, and schema validation
 //! is out of scope.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,19 @@ pub struct CompletionSchema {
     /// The binding file this schema was read from.
     pub file: PathBuf,
     /// Property name -> hint.
+    pub properties: BTreeMap<String, PropertyHint>,
+    /// Child-node schemas keyed by `patternProperties` patterns.
+    pub children: Vec<ChildSchema>,
+}
+
+/// A child-node schema: the `patternProperties` entries of a binding whose
+/// patterns a child node's NAME matches, with properties merged from inline
+/// definitions and relative `$ref`s.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChildSchema {
+    /// Raw `patternProperties` pattern keys (alternatives split out).
+    pub patterns: Vec<String>,
+    /// Property name -> hint for the child node.
     pub properties: BTreeMap<String, PropertyHint>,
 }
 
@@ -68,6 +81,9 @@ pub struct Bindings {
     /// Consulted for VALUE completion only — their property names are
     /// deliberately not suggested universally.
     common: BTreeMap<String, PropertyHint>,
+    /// Neighbor schema files pulled in by patternProperties `$ref`s,
+    /// parsed once per absolute path.
+    ref_cache: HashMap<PathBuf, Value>,
 }
 
 impl Bindings {
@@ -102,27 +118,7 @@ impl Bindings {
         for compatible in compatibles {
             for idx in self.by_compatible.get(compatible).into_iter().flatten() {
                 for (name, hint) in &self.schemas[*idx].properties {
-                    let entry = merged.entry(name.clone()).or_default();
-                    entry.required |= hint.required;
-                    entry.boolean |= hint.boolean;
-                    entry.deprecated |= hint.deprecated;
-                    for value in &hint.values {
-                        if !entry.values.contains(value) {
-                            entry.values.push(value.clone());
-                        }
-                    }
-                    if entry.type_hint.is_none() {
-                        entry.type_hint = hint.type_hint.clone();
-                    }
-                    if entry.description.is_none() {
-                        entry.description = hint.description.clone();
-                    }
-                    for (prefix, header) in &hint.define_families {
-                        entry
-                            .define_families
-                            .entry(prefix.clone())
-                            .or_insert_with(|| header.clone());
-                    }
+                    merge_hint(merged.entry(name.clone()).or_default(), hint);
                 }
             }
         }
@@ -163,9 +159,11 @@ impl Bindings {
             return;
         }
         let properties = extract_properties(binding);
+        let children = extract_children(binding, &file, &mut self.ref_cache);
         self.schemas.push(CompletionSchema {
             file,
             properties,
+            children,
         });
         let idx = self.schemas.len() - 1;
         for compatible in compatibles {
@@ -180,24 +178,7 @@ impl Bindings {
     /// candidates dedupe across files. See `common`.
     fn add_common_schema(&mut self, binding: &Value) {
         for (name, hint) in extract_properties(binding) {
-            let entry = self.common.entry(name).or_default();
-            entry.required |= hint.required;
-            entry.boolean |= hint.boolean;
-            entry.deprecated |= hint.deprecated;
-            for (prefix, header) in hint.define_families {
-                entry.define_families.entry(prefix).or_insert(header);
-            }
-            for value in hint.values {
-                if !entry.values.contains(&value) {
-                    entry.values.push(value);
-                }
-            }
-            if entry.type_hint.is_none() {
-                entry.type_hint = hint.type_hint;
-            }
-            if entry.description.is_none() {
-                entry.description = hint.description;
-            }
+            merge_hint(self.common.entry(name).or_default(), &hint);
         }
     }
 
@@ -217,6 +198,29 @@ impl Bindings {
     /// leds/common.yaml).
     pub fn common_hint(&self, name: &str) -> Option<&PropertyHint> {
         self.common.get(name)
+    }
+
+    /// Property hints for a CHILD node keyed by its parent's binding:
+    /// every child schema of the schemas matching `parent_compatibles`
+    /// whose `patternProperties` keys match `child_name`.
+    pub fn child_properties_for(
+        &self,
+        parent_compatibles: &[String],
+        child_name: &str,
+    ) -> BTreeMap<String, PropertyHint> {
+        let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
+        for compatible in parent_compatibles {
+            for idx in self.by_compatible.get(compatible).into_iter().flatten() {
+                for child in &self.schemas[*idx].children {
+                    if pattern_matches(&child.patterns, child_name) {
+                        for (name, hint) in &child.properties {
+                            merge_hint(merged.entry(name.clone()).or_default(), hint);
+                        }
+                    }
+                }
+            }
+        }
+        merged
     }
 
     /// The number of distinct property names contributed by common-part
@@ -383,6 +387,225 @@ fn define_families_from(description: Option<&str>) -> BTreeMap<String, String> {
     families
 }
 
+/// Fold `src` into `dst`: required/boolean/deprecated OR together, values
+/// dedupe, and the first non-empty optional field wins.
+fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
+    dst.required |= src.required;
+    dst.boolean |= src.boolean;
+    dst.deprecated |= src.deprecated;
+    for value in &src.values {
+        if !dst.values.contains(value) {
+            dst.values.push(value.clone());
+        }
+    }
+    if dst.type_hint.is_none() {
+        dst.type_hint = src.type_hint.clone();
+    }
+    if dst.description.is_none() {
+        dst.description = src.description.clone();
+    }
+    for (prefix, header) in &src.define_families {
+        dst.define_families
+            .entry(prefix.clone())
+            .or_insert_with(|| header.clone());
+    }
+}
+
+/// Extract the binding's `patternProperties` child schemas: per pattern,
+/// the child's INLINE properties merged with a relative `$ref`'s leaf
+/// properties (dtschema merges both, e.g. leds-gpio children $ref
+/// leds/common.yaml while adding `gpios`). Ref expansion is depth-one by
+/// design — grandchildren are a follow-up — so refs cannot cycle.
+fn extract_children(
+    binding: &Value,
+    schema_file: &Path,
+    ref_cache: &mut HashMap<PathBuf, Value>,
+) -> Vec<ChildSchema> {
+    let Some(Value::Mapping(patterns)) = binding.get("patternProperties") else {
+        return Vec::new();
+    };
+    let dir = schema_file.parent().unwrap_or(Path::new("."));
+    let mut children = Vec::new();
+    for (pattern, value) in patterns {
+        let (Some(pattern), Value::Mapping(child)) = (pattern.as_str(), value) else {
+            continue;
+        };
+        let mut properties: BTreeMap<String, PropertyHint> = BTreeMap::new();
+        if let Some(reference) = child.get("$ref").and_then(Value::as_str) {
+            if let Some((target, segments)) = split_ref(dir, reference) {
+                if let Some(referenced) = load_ref_value(target, &segments, ref_cache) {
+                    for (name, hint) in extract_properties(referenced) {
+                        merge_hint(properties.entry(name).or_default(), &hint);
+                    }
+                }
+            }
+        }
+        for (name, hint) in extract_properties(value) {
+            merge_hint(properties.entry(name).or_default(), &hint);
+        }
+        children.push(ChildSchema {
+            patterns: split_patterns(pattern),
+            properties,
+        });
+    }
+    children
+}
+
+/// Split a schema-local `$ref` into the target file path (resolved against
+/// the referencing schema's directory) and the post-`#` key segments.
+/// External refs (`/schemas/…`, absolute paths, URLs) resolve to None.
+fn split_ref(dir: &Path, reference: &str) -> Option<(PathBuf, Vec<String>)> {
+    let (file, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+    if file.contains("://") || file.starts_with('/') || file.is_empty() {
+        return None;
+    }
+    let target = fs::canonicalize(dir.join(file)).ok()?;
+    let segments = fragment
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some((target, segments))
+}
+
+/// The (cached) yaml value a `$ref` points at: load and parse the file on
+/// first use, then descend the `#/a/b` fragment keys.
+fn load_ref_value<'v>(
+    target: PathBuf,
+    segments: &[String],
+    ref_cache: &'v mut HashMap<PathBuf, Value>,
+) -> Option<&'v Value> {
+    if !ref_cache.contains_key(&target) {
+        let Ok(text) = fs::read_to_string(&target) else {
+            return None;
+        };
+        let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+            return None;
+        };
+        ref_cache.insert(target.clone(), value);
+    }
+    let mut current = ref_cache.get(&target)?;
+    for segment in segments {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+/// The alternatives of a `patternProperties` key: strip one surrounding
+/// paren pair and split on `|` — "(^led-[0-9a-f]$|led)" becomes
+/// ["^led-[0-9a-f]$", "led"].
+fn split_patterns(pattern: &str) -> Vec<String> {
+    let trimmed = pattern.trim();
+    let inner = trimmed
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(trimmed);
+    inner
+        .split('|')
+        .map(str::trim)
+        .filter(|alt| !alt.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether the child node NAME matches the binding pattern keys.
+/// Alternatives test in order; plain literals bind via contains/prefix/
+/// suffix/equality per anchors, regex-y alternatives (character classes,
+/// `.*`) fall back to literal-run tests — deliberate OVER-match: this
+/// suggests, it does not validate.
+fn pattern_matches(patterns: &[String], node_name: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| alternative_matches(pattern, node_name))
+}
+
+fn alternative_matches(pattern: &str, name: &str) -> bool {
+    let mut anchored_start = false;
+    let mut anchored_end = false;
+    let mut rest = pattern;
+    if let Some(stripped) = rest.strip_prefix('^') {
+        anchored_start = true;
+        rest = stripped;
+    }
+    if let Some(stripped) = rest.strip_suffix('$') {
+        anchored_end = true;
+        rest = stripped;
+    }
+    // Leading/trailing wildcard runs void their anchors: `^.*-pins$` anchors
+    // nothing at the start, it only says the name ends in `-pins`.
+    if let Some(stripped) = rest.strip_prefix(".*").or_else(|| rest.strip_prefix(".+")) {
+        anchored_start = false;
+        rest = stripped;
+    }
+    if let Some(stripped) = rest.strip_suffix(".*").or_else(|| rest.strip_suffix(".+")) {
+        anchored_end = false;
+        rest = stripped;
+    }
+    if is_plain_literal(rest) {
+        return if anchored_start && anchored_end {
+            name == rest
+        } else if anchored_start {
+            name.starts_with(rest)
+        } else if anchored_end {
+            name.ends_with(rest)
+        } else {
+            name.contains(rest)
+        };
+    }
+    // regex metachars present: require the first/last literal runs per
+    // anchors, over the exact class contents (completion-friendly)
+    let runs = literal_runs(rest);
+    let Some(first) = runs.first() else {
+        return false;
+    };
+    if anchored_start {
+        if !name.starts_with(first.as_str()) {
+            return false;
+        }
+        return if runs.len() == 1 && anchored_end {
+            name.ends_with(first.as_str())
+        } else {
+            true
+        };
+    }
+    if let Some(last) = runs.last() {
+        if anchored_end {
+            return name.ends_with(last.as_str());
+        }
+    }
+    runs.iter().all(|run| name.contains(run.as_str()))
+}
+
+fn is_plain_literal(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The maximal runs of `text` that contain no regex metachars.
+fn literal_runs(text: &str) -> Vec<String> {
+    let metachar = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if metachar(c) {
+            if !current.is_empty() {
+                runs.push(current);
+                current = String::new();
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+/// The tail of a types.yaml `$ref`, e.g. `uint32` from
+/// `/schemas/types.yaml#/definitions/uint32`.
 fn type_ref_tail(reference: &str) -> Option<String> {
     reference
         .rsplit_once("types.yaml#/definitions/")
@@ -699,6 +922,130 @@ there is no matching LED_COLOR_ID available, add a new one.";
         assert!(define_families_from(Some("a plain description")).is_empty());
         assert!(define_families_from(Some("mentions LED_COLOR_ID_* but no header")).is_empty());
         assert!(define_families_from(None).is_empty());
+    }
+
+    #[test]
+    pub fn child_patterns_match_binding_node_names() {
+        let m = |pattern: &str, name: &str| pattern_matches(&split_patterns(pattern), name);
+        // anchored literal: suffix / prefix / equality
+        assert!(m("grp$", "uart1grp"));
+        assert!(!m("grp$", "grpfoo"));
+        assert!(m("^pins-", "pins-led"));
+        assert!(!m("^pins-", "gpios-1"));
+        assert!(m("^grp$", "grp"));
+        assert!(!m("^grp$", "grp2"));
+        // unanchored literal binds as substring (dtschema uses it to cast
+        // a wide net, e.g. leds' "just 'led' anywhere")
+        assert!(m("led", "led-status"));
+        assert!(!m("led", "backlight"));
+        // wildcard-run patterns: anchors fall away behind `.*`
+        assert!(m("^.*-pins$", "host-pins"));
+        assert!(!m("^.*-pins$", "host-clocks"));
+        // parenthesized alternatives with a character class: the class
+        // content is deliberately over-matched
+        assert!(m("(^led-[0-9a-f]$|led)", "led-1"));
+        assert!(m("(^led-[0-9a-f]$|led)", "led-status"));
+        assert!(!m("(^led-[0-9a-f]$|led)", "backlight"));
+    }
+
+    #[test]
+    pub fn child_properties_merge_inline_and_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("common2.yaml"),
+            r#"
+properties:
+  color:
+    description: Use one of the LED_COLOR_ID_* prefixed definitions from the header include/dt-bindings/leds/common.h.
+  label: true
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("leds.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,led
+patternProperties:
+  "(^led-[0-9a-f]$|led)":
+    type: object
+    $ref: common2.yaml#
+    properties:
+      gpios: true
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pinctrl2.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,pctl
+patternProperties:
+  'grp$':
+    type: object
+    properties:
+      fsl,pins: true
+"#,
+        )
+        .unwrap();
+
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+
+        // inline + ref-merged LED child hints, only for matching child names
+        let hints = bindings.child_properties_for(&["vendor,led".to_string()], "led-status");
+        assert!(hints.contains_key("gpios"));
+        assert!(hints.contains_key("color"));
+        assert!(hints.contains_key("label"));
+        assert!(hints["color"]
+            .define_families
+            .contains_key("LED_COLOR_ID_"));
+        assert!(bindings
+            .child_properties_for(&["vendor,led".to_string()], "clock-controller")
+            .is_empty());
+
+        // inline-only child schema (imx pinctrl shape)
+        let hints = bindings.child_properties_for(&["vendor,pctl".to_string()], "uart1grp");
+        assert!(hints.contains_key("fsl,pins"));
+        assert!(bindings
+            .child_properties_for(&["vendor,pctl".to_string()], "somewhere-else")
+            .is_empty());
+    }
+
+    #[test]
+    pub fn mutual_child_refs_do_not_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,a
+patternProperties:
+  '^a-':
+    $ref: b.yaml#
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.yaml"),
+            r#"
+properties:
+  b-marker: true
+  compatible:
+    const: vendor,b
+patternProperties:
+  '^b-':
+    $ref: a.yaml#
+"#,
+        )
+        .unwrap();
+
+        // depth-one ref expansion cannot loop; indexing terminates
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let hints = bindings.child_properties_for(&["vendor,a".to_string()], "a-child");
+        assert!(hints.contains_key("b-marker"));
     }
 
     #[test]
