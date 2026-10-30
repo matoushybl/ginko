@@ -2,7 +2,7 @@ use ginko::dts::{
     AnyDirective, Bindings, CompletionContext, FileType, HasSpan, IncludeLoader,
     IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload,
     ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, ResolvedProperty, Severity,
-    SeverityMap, Span, node_compatibles,
+    SeverityMap, Span, merge_hint, node_compatibles,
 };
 use ginko::header::{Define, TokenKind, parse_header};
 use itertools::Itertools;
@@ -104,10 +104,11 @@ impl Backend {
         let paths: Vec<PathBuf> = binding_paths.iter().map(PathBuf::from).collect();
         self.bindings = Bindings::from_paths(&paths);
         tracing::info!(
-            "bindings: indexed {} schemas over {} compatible strings, {} common properties",
+            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas",
             self.bindings.schema_count(),
             self.bindings.compatible_count(),
-            self.bindings.common_prop_count()
+            self.bindings.common_prop_count(),
+            self.bindings.child_schema_count()
         );
         self
     }
@@ -428,10 +429,14 @@ impl LanguageServer for Backend {
             ))
         }
 
-        /// Property hints for a compatible-less CHILD node keyed by its
-        /// parent's binding: the parent node of the position's enclosing
-        /// node supplies compatibles, its binding's `patternProperties`
-        /// supply the child schemas, keyed by the child's own node name.
+        /// Property hints for a compatible-less CHILD node keyed by the
+        /// nearest binding-bearing ancestor: every prefix of the name
+        /// trail is queried against the compatibles of the node sitting
+        /// at that prefix, and the results merge. The deepest hop — the
+        /// parent's binding, the enclosing node's own name as a
+        /// one-element path — is the v1 direct-child lookup; shallower
+        /// hops light up grandchild chains (ports → port@N → endpoint)
+        /// through compatible-less intermediate nodes.
         fn child_binding_hints(
             project: &Project,
             file_path: &Path,
@@ -442,10 +447,18 @@ impl LanguageServer for Backend {
             let tree = analysis.get_resolved_tree();
             let file = project.canonical_path(file_path);
             let (_, trail) = tree.node_and_path_at_position(&file, pos)?;
-            let name = trail.last()?;
-            let parent = tree.node_at_path(&trail[..trail.len() - 1])?;
-            let hints = bindings.child_properties_for(&node_compatibles(parent), name);
-            (!hints.is_empty()).then_some(hints)
+            let mut merged: BTreeMap<String, ginko::dts::PropertyHint> = BTreeMap::new();
+            for split in (0..trail.len()).rev() {
+                let Some(ancestor) = tree.node_at_path(&trail[..split]) else {
+                    continue;
+                };
+                let hints =
+                    bindings.child_properties_for(&node_compatibles(ancestor), &trail[split..]);
+                for (name, hint) in hints {
+                    merge_hint(merged.entry(name).or_default(), &hint);
+                }
+            }
+            (!merged.is_empty()).then_some(merged)
         }
 
         fn completions_for_node(
@@ -486,20 +499,29 @@ impl LanguageServer for Backend {
                 if items.iter().any(|item| item.label == name) {
                     continue;
                 }
-                let snippet = if hint.boolean {
-                    format!("{name};")
+                let (snippet, detail, kind) = if hint.child_object {
+                    (
+                        format!("{name} {{\n\t$0\n}};"),
+                        "child node".to_string(),
+                        CompletionItemKind::MODULE,
+                    )
                 } else {
-                    format!("{name} = $0;")
-                };
-                let detail = if hint.required {
-                    "required property".to_string()
-                } else {
-                    hint.type_hint.unwrap_or_else(|| "property".to_string())
+                    let snippet = if hint.boolean {
+                        format!("{name};")
+                    } else {
+                        format!("{name} = $0;")
+                    };
+                    let detail = if hint.required {
+                        "required property".to_string()
+                    } else {
+                        hint.type_hint.unwrap_or_else(|| "property".to_string())
+                    };
+                    (snippet, detail, CompletionItemKind::FIELD)
                 };
                 let mut item = CompletionItem {
                     label: name,
                     detail: Some(detail),
-                    kind: Some(CompletionItemKind::FIELD),
+                    kind: Some(kind),
                     insert_text: Some(snippet),
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                     ..Default::default()
@@ -512,29 +534,40 @@ impl LanguageServer for Backend {
                 }
                 items.push(item);
             }
-            // Child-node binding hints: binding children keyed by the
-            // parent's `patternProperties` (pinctrl groups, LEDs, ...) share
-            // the own-binding item shape, at lower priority.
+            // Ancestor-composed binding hints: children keyed by any
+            // binding-bearing ancestor of the position (pinctrl groups,
+            // LEDs, endpoints, ...) share the own-binding item shape,
+            // classified child-node entries take the node-creation
+            // snippet; lower priority than the node's own binding.
             for (name, hint) in child_hints.into_iter().flatten() {
                 if items.iter().any(|item| item.label == *name) {
                     continue;
                 }
-                let snippet = if hint.boolean {
-                    format!("{name};")
+                let (snippet, detail, kind) = if hint.child_object {
+                    (
+                        format!("{name} {{\n\t$0\n}};"),
+                        "child node".to_string(),
+                        CompletionItemKind::MODULE,
+                    )
                 } else {
-                    format!("{name} = $0;")
-                };
-                let detail = if hint.required {
-                    "required property".to_string()
-                } else {
-                    hint.type_hint
-                        .clone()
-                        .unwrap_or_else(|| "property".to_string())
+                    let snippet = if hint.boolean {
+                        format!("{name};")
+                    } else {
+                        format!("{name} = $0;")
+                    };
+                    let detail = if hint.required {
+                        "required property".to_string()
+                    } else {
+                        hint.type_hint
+                            .clone()
+                            .unwrap_or_else(|| "property".to_string())
+                    };
+                    (snippet, detail, CompletionItemKind::FIELD)
                 };
                 let mut item = CompletionItem {
                     label: name.clone(),
                     detail: Some(detail),
-                    kind: Some(CompletionItemKind::FIELD),
+                    kind: Some(kind),
                     insert_text: Some(snippet),
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                     ..Default::default()

@@ -33,14 +33,19 @@ pub struct CompletionSchema {
 }
 
 /// A child-node schema: the `patternProperties` entries of a binding whose
-/// patterns a child node's NAME matches, with properties merged from inline
-/// definitions and relative `$ref`s.
+/// patterns a child node's NAME matches, plus fixed-name node entries under
+/// `properties` (classified as child nodes), with properties merged from
+/// inline definitions and `$ref`s. `children` carries grandchildren —
+/// recursion is depth-capped and cycle-guarded.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChildSchema {
-    /// Raw `patternProperties` pattern keys (alternatives split out).
+    /// Raw pattern keys (alternatives split out); fixed-name children use
+    /// `^name$`.
     pub patterns: Vec<String>,
     /// Property name -> hint for the child node.
     pub properties: BTreeMap<String, PropertyHint>,
+    /// Grandchildren: the child's own child-node schemas.
+    pub children: Vec<ChildSchema>,
 }
 
 /// Per-property completion hints from a binding.
@@ -65,6 +70,9 @@ pub struct PropertyHint {
     /// the LED_COLOR_ID_* prefixed definitions …"), mapped to the relative
     /// header path that defines them.
     pub define_families: BTreeMap<String, String>,
+    /// The entry structurally denotes a child NODE (carries child schemas)
+    /// rather than a leaf — rendered as a node-creation snippet.
+    pub child_object: bool,
 }
 
 /// Indexed data distilled from a set of binding roots.
@@ -84,6 +92,9 @@ pub struct Bindings {
     /// Neighbor schema files pulled in by patternProperties `$ref`s,
     /// parsed once per absolute path.
     ref_cache: HashMap<PathBuf, Value>,
+    /// The binding roots given to `from_paths` — the resolution base for
+    /// dt-schema flavour absolute refs (`/schemas/graph.yaml#/…`).
+    roots: Vec<PathBuf>,
 }
 
 impl Bindings {
@@ -95,7 +106,10 @@ impl Bindings {
         for path in paths {
             collect_yaml_files(path, &mut files);
         }
-        let mut bindings = Bindings::default();
+        let mut bindings = Bindings {
+            roots: paths.to_vec(),
+            ..Default::default()
+        };
         for file in files {
             bindings.add_file(&file);
         }
@@ -159,7 +173,14 @@ impl Bindings {
             return;
         }
         let properties = extract_properties(binding);
-        let children = extract_children(binding, &file, &mut self.ref_cache);
+        let children = extract_children(
+            binding,
+            &file,
+            &self.roots,
+            &mut self.ref_cache,
+            &mut Vec::new(),
+            0,
+        );
         self.schemas.push(CompletionSchema {
             file,
             properties,
@@ -200,24 +221,42 @@ impl Bindings {
         self.common.get(name)
     }
 
-    /// Property hints for a CHILD node keyed by its parent's binding:
-    /// every child schema of the schemas matching `parent_compatibles`
-    /// whose `patternProperties` keys match `child_name`.
+    /// Property hints for a DESCENDANT node: walk the child schemas of every
+    /// schema matching `compatibles` down `path` (one node name per level,
+    /// the target node's own name last); the properties of the schemas
+    /// matching the FINAL name merge out. A one-element path is the
+    /// direct-child lookup; deeper paths light up grandchildren
+    /// (ports → port@N → endpoint chains).
     pub fn child_properties_for(
         &self,
-        parent_compatibles: &[String],
-        child_name: &str,
+        compatibles: &[String],
+        path: &[String],
     ) -> BTreeMap<String, PropertyHint> {
-        let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
-        for compatible in parent_compatibles {
+        let mut pool: Vec<&ChildSchema> = Vec::new();
+        for compatible in compatibles {
             for idx in self.by_compatible.get(compatible).into_iter().flatten() {
-                for child in &self.schemas[*idx].children {
-                    if pattern_matches(&child.patterns, child_name) {
-                        for (name, hint) in &child.properties {
-                            merge_hint(merged.entry(name.clone()).or_default(), hint);
-                        }
-                    }
-                }
+                pool.extend(self.schemas[*idx].children.iter());
+            }
+        }
+        let mut matched: Vec<&ChildSchema> = Vec::new();
+        for name in path {
+            matched = pool
+                .iter()
+                .copied()
+                .filter(|schema| pattern_matches(&schema.patterns, name))
+                .collect();
+            if matched.is_empty() {
+                return BTreeMap::new();
+            }
+            pool = matched
+                .iter()
+                .flat_map(|schema| schema.children.iter())
+                .collect();
+        }
+        let mut merged = BTreeMap::new();
+        for schema in matched {
+            for (name, hint) in &schema.properties {
+                merge_hint(merged.entry(name.clone()).or_default(), hint);
             }
         }
         merged
@@ -228,6 +267,17 @@ impl Bindings {
     /// feed value completion.
     pub fn common_prop_count(&self) -> usize {
         self.common.len()
+    }
+
+    /// Every indexed child schema, grandchildren included — audit metric.
+    pub fn child_schema_count(&self) -> usize {
+        fn count(children: &[ChildSchema]) -> usize {
+            children.iter().map(|child| 1 + count(&child.children)).sum()
+        }
+        self.schemas
+            .iter()
+            .map(|schema| count(&schema.children))
+            .sum()
     }
 }
 
@@ -339,6 +389,7 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
         deprecated,
         values,
         define_families,
+        child_object: node_like(sub),
     }
 }
 
@@ -357,7 +408,7 @@ fn define_families_from(description: Option<&str>) -> BTreeMap<String, String> {
     let rest = &description[start..];
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let header = rest[..end]
-        .trim_end_matches(|c| c == '.' || c == ',' || c == ';')
+        .trim_end_matches(['.', ',', ';'])
         .to_string();
     if !header.ends_with(".h") || header == ".h" {
         return BTreeMap::new();
@@ -389,7 +440,7 @@ fn define_families_from(description: Option<&str>) -> BTreeMap<String, String> {
 
 /// Fold `src` into `dst`: required/boolean/deprecated OR together, values
 /// dedupe, and the first non-empty optional field wins.
-fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
+pub fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
     dst.required |= src.required;
     dst.boolean |= src.boolean;
     dst.deprecated |= src.deprecated;
@@ -404,6 +455,7 @@ fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
     if dst.description.is_none() {
         dst.description = src.description.clone();
     }
+    dst.child_object |= src.child_object;
     for (prefix, header) in &src.define_families {
         dst.define_families
             .entry(prefix.clone())
@@ -411,55 +463,224 @@ fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
     }
 }
 
-/// Extract the binding's `patternProperties` child schemas: per pattern,
-/// the child's INLINE properties merged with a relative `$ref`'s leaf
-/// properties (dtschema merges both, e.g. leds-gpio children $ref
-/// leds/common.yaml while adding `gpios`). Ref expansion is depth-one by
-/// design — grandchildren are a follow-up — so refs cannot cycle.
+/// Extract the child-node schemas of `schema`: `patternProperties` entries
+/// (pattern children) and `properties` entries that structurally denote
+/// child nodes (fixed-name children). The view merges inline content with
+/// a `$ref`-resolved counterpart — dtschema merges both (leds-gpio children
+/// $ref leds/common.yaml while adding `gpios`; tegra210-sfc's `ports` $refs
+/// dt-schema's graph.yaml while pinning port@0). Recursion is depth-capped;
+/// ref cycles cut off via the visited stack of (file, fragment) resolution
+/// targets — same-file `$defs` chains are distinct targets, not cycles.
 fn extract_children(
-    binding: &Value,
+    schema: &Value,
     schema_file: &Path,
+    roots: &[PathBuf],
     ref_cache: &mut HashMap<PathBuf, Value>,
+    visited: &mut Vec<(PathBuf, Vec<String>)>,
+    depth: usize,
 ) -> Vec<ChildSchema> {
-    let Some(Value::Mapping(patterns)) = binding.get("patternProperties") else {
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH {
         return Vec::new();
-    };
-    let dir = schema_file.parent().unwrap_or(Path::new("."));
-    let mut children = Vec::new();
-    for (pattern, value) in patterns {
-        let (Some(pattern), Value::Mapping(child)) = (pattern.as_str(), value) else {
-            continue;
-        };
-        let mut properties: BTreeMap<String, PropertyHint> = BTreeMap::new();
-        if let Some(reference) = child.get("$ref").and_then(Value::as_str) {
-            if let Some((target, segments)) = split_ref(dir, reference) {
-                if let Some(referenced) = load_ref_value(target, &segments, ref_cache) {
-                    for (name, hint) in extract_properties(referenced) {
-                        merge_hint(properties.entry(name).or_default(), &hint);
-                    }
+    }
+    // collect catalog entries (patterns, subschema clone, origin file) from
+    // both views; clones avoid holding ref-cache borrows across recursion
+    let mut entries: Vec<(Vec<String>, Value, PathBuf)> = Vec::new();
+    collect_child_entries(schema, schema_file, ref_cache, roots, visited, &mut entries);
+    let mut pushed_ref = false;
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        if let Some((target, segments)) = split_ref(schema_file, reference, roots) {
+            let expansion = (target.clone(), segments.clone());
+            if !visited.contains(&expansion) {
+                if let Some(view) = load_ref_value(target.clone(), &segments, ref_cache) {
+                    let view = view.clone();
+                    visited.push(expansion);
+                    pushed_ref = true;
+                    // the view's entries belong to the TARGET file: their
+                    // own fragment (#/…) and relative refs resolve there,
+                    // not in the schema doing the $ref'ing
+                    collect_child_entries(
+                        &view,
+                        &target,
+                        ref_cache,
+                        roots,
+                        visited,
+                        &mut entries,
+                    );
                 }
             }
         }
-        for (name, hint) in extract_properties(value) {
-            merge_hint(properties.entry(name).or_default(), &hint);
+    }
+    // build per entry, merging same-pattern (duplicated inline+ref) entries
+    let mut children: Vec<ChildSchema> = Vec::new();
+    for (patterns, subschema, origin_file) in entries {
+        let built = child_schema_for(
+            patterns,
+            &subschema,
+            &origin_file,
+            roots,
+            ref_cache,
+            visited,
+            depth,
+        );
+        if let Some(existing) = children
+            .iter_mut()
+            .find(|child| child.patterns == built.patterns)
+        {
+            for (name, hint) in &built.properties {
+                merge_hint(existing.properties.entry(name.clone()).or_default(), hint);
+            }
+            existing.children.extend(built.children);
+        } else {
+            children.push(built);
         }
-        children.push(ChildSchema {
-            patterns: split_patterns(pattern),
-            properties,
-        });
+    }
+    if pushed_ref {
+        visited.pop();
     }
     children
 }
 
-/// Split a schema-local `$ref` into the target file path (resolved against
-/// the referencing schema's directory) and the post-`#` key segments.
-/// External refs (`/schemas/…`, absolute paths, URLs) resolve to None.
-fn split_ref(dir: &Path, reference: &str) -> Option<(PathBuf, Vec<String>)> {
+/// One entry's full ChildSchema: leaf properties merge the entry's inline and
+/// `$ref`-resolved views; its own children recurse from the merged view.
+fn child_schema_for(
+    patterns: Vec<String>,
+    subschema: &Value,
+    origin_file: &Path,
+    roots: &[PathBuf],
+    ref_cache: &mut HashMap<PathBuf, Value>,
+    visited: &mut Vec<(PathBuf, Vec<String>)>,
+    depth: usize,
+) -> ChildSchema {
+    let mut properties: BTreeMap<String, PropertyHint> = BTreeMap::new();
+    if let Some(reference) = subschema.get("$ref").and_then(Value::as_str) {
+        if let Some((target, segments)) = split_ref(origin_file, reference, roots) {
+            if let Some(view) = load_ref_value(target, &segments, ref_cache) {
+                for (name, hint) in extract_properties(view) {
+                    merge_hint(properties.entry(name).or_default(), &hint);
+                }
+            }
+        }
+    }
+    for (name, hint) in extract_properties(subschema) {
+        merge_hint(properties.entry(name).or_default(), &hint);
+    }
+    let children = extract_children(subschema, origin_file, roots, ref_cache, visited, depth + 1);
+    ChildSchema {
+        patterns,
+        properties,
+        children,
+    }
+}
+
+/// Append the patternProperties entries and the child-node classified
+/// `properties` entries of `view` to `entries`.
+fn collect_child_entries(
+    view: &Value,
+    origin_file: &Path,
+    ref_cache: &mut HashMap<PathBuf, Value>,
+    roots: &[PathBuf],
+    visited: &mut Vec<(PathBuf, Vec<String>)>,
+    entries: &mut Vec<(Vec<String>, Value, PathBuf)>,
+) {
+    if let Some(Value::Mapping(patterns)) = view.get("patternProperties") {
+        for (pattern, child) in patterns {
+            let (Some(pattern), Value::Mapping(_)) = (pattern.as_str(), child) else {
+                continue;
+            };
+            entries.push((
+                split_patterns(pattern),
+                child.clone(),
+                origin_file.to_path_buf(),
+            ));
+        }
+    }
+    if let Some(Value::Mapping(props)) = view.get("properties") {
+        for (name, sub) in props {
+            let (Some(name), Value::Mapping(_)) = (name.as_str(), sub) else {
+                continue;
+            };
+            if node_like_or_resolved(sub, origin_file, ref_cache, roots, visited) {
+                entries.push((
+                    vec![format!("^{name}$")],
+                    sub.clone(),
+                    origin_file.to_path_buf(),
+                ));
+            }
+        }
+    }
+}
+
+/// devicetree nodes double as properties — dt-schema keeps no node/leaf
+/// distinction, so completion invents one: a mapping entry is node-like
+/// when its own body carries non-empty nested `properties`/
+/// `patternProperties`, or when its `$ref`-resolved counterpart does
+/// (e.g. bare `port@0: $ref: audio-graph-port.yaml#` entries).
+fn node_like(value: &Value) -> bool {
+    for key in ["properties", "patternProperties"] {
+        if let Some(Value::Mapping(inner)) = value.get(key) {
+            if !inner.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn node_like_or_resolved(
+    sub: &Value,
+    origin_file: &Path,
+    ref_cache: &mut HashMap<PathBuf, Value>,
+    roots: &[PathBuf],
+    visited: &[(PathBuf, Vec<String>)],
+) -> bool {
+    if node_like(sub) {
+        return true;
+    }
+    let Some(reference) = sub.get("$ref").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some((target, segments)) = split_ref(origin_file, reference, roots) else {
+        return false;
+    };
+    if visited.contains(&(target.clone(), segments.clone())) {
+        return false;
+    }
+    load_ref_value(target, &segments, ref_cache).is_some_and(node_like)
+}
+
+/// Split a schema `$ref` into the target file path and the post-`#` key
+/// segments. Handles three flavours: same-file `#/…` fragments, relative
+/// neighbor files (`common.yaml#/…`), and dt-schema absolute refs
+/// (`/schemas/graph.yaml#/…`) resolved against every registered binding
+/// root — either verbatim or without the `schemas/` prefix (the dtschema
+/// pip root IS the schemas dir). URLs stay unresolvable.
+fn split_ref(schema_file: &Path, reference: &str, roots: &[PathBuf]) -> Option<(PathBuf, Vec<String>)> {
     let (file, fragment) = reference.split_once('#').unwrap_or((reference, ""));
-    if file.contains("://") || file.starts_with('/') || file.is_empty() {
+    if file.contains("://") {
         return None;
     }
-    let target = fs::canonicalize(dir.join(file)).ok()?;
+    let target = if file.is_empty() {
+        fs::canonicalize(schema_file).ok()?
+    } else if file.starts_with('/') {
+        let rel = file.trim_start_matches('/');
+        let stripped = rel.strip_prefix("schemas/").unwrap_or(rel);
+        let mut found = None;
+        'roots: for root in roots {
+            for candidate in [root.join(rel), root.join(stripped)] {
+                if candidate.exists() {
+                    if let Ok(canonical) = fs::canonicalize(&candidate) {
+                        found = Some(canonical);
+                        break 'roots;
+                    }
+                }
+            }
+        }
+        found?
+    } else {
+        let dir = schema_file.parent().unwrap_or(Path::new("."));
+        fs::canonicalize(dir.join(file)).ok()?
+    };
     let segments = fragment
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -580,12 +801,13 @@ fn is_plain_literal(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '@')
 }
 
 /// The maximal runs of `text` that contain no regex metachars.
 fn literal_runs(text: &str) -> Vec<String> {
-    let metachar = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let metachar =
+        |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '@');
     let mut runs = Vec::new();
     let mut current = String::new();
     for c in text.chars() {
@@ -624,15 +846,15 @@ fn collect_value_strings(value: &Value, out: &mut Vec<String>) {
                     Some("enum") => {
                         if let Value::Sequence(items) = val {
                             for item in items {
-                                if let Some(string) = item.as_str() {
-                                    out.push(string.to_string());
+                                if let Some(scalar) = scalar_string(item) {
+                                    out.push(scalar);
                                 }
                             }
                         }
                     }
                     Some("const") => {
-                        if let Some(string) = val.as_str() {
-                            out.push(string.to_string());
+                        if let Some(scalar) = scalar_string(val) {
+                            out.push(scalar);
                         }
                     }
                     Some("properties" | "patternProperties" | "examples") => {}
@@ -646,6 +868,16 @@ fn collect_value_strings(value: &Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Binding `enum:`/`const:` bare scalars — integers as well as strings
+/// (video-interfaces' `bus-type: enum: [4, 5, 6]`).
+fn scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(string) => Some(string.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
     }
 }
 
@@ -938,6 +1170,9 @@ there is no matching LED_COLOR_ID available, add a new one.";
         // a wide net, e.g. leds' "just 'led' anywhere")
         assert!(m("led", "led-status"));
         assert!(!m("led", "backlight"));
+        // the unit-address @ joins the literal runs (graph.yaml chains)
+        assert!(m("^port@[0-9a-f]+$", "port@0"));
+        assert!(!m("^port@[0-9a-f]+$", "flash@0"));
         // wildcard-run patterns: anchors fall away behind `.*`
         assert!(m("^.*-pins$", "host-pins"));
         assert!(!m("^.*-pins$", "host-clocks"));
@@ -994,7 +1229,10 @@ patternProperties:
         let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
 
         // inline + ref-merged LED child hints, only for matching child names
-        let hints = bindings.child_properties_for(&["vendor,led".to_string()], "led-status");
+        let hints = bindings.child_properties_for(
+            &["vendor,led".to_string()],
+            &["led-status".to_string()],
+        );
         assert!(hints.contains_key("gpios"));
         assert!(hints.contains_key("color"));
         assert!(hints.contains_key("label"));
@@ -1002,14 +1240,23 @@ patternProperties:
             .define_families
             .contains_key("LED_COLOR_ID_"));
         assert!(bindings
-            .child_properties_for(&["vendor,led".to_string()], "clock-controller")
+            .child_properties_for(
+                &["vendor,led".to_string()],
+                &["clock-controller".to_string()],
+            )
             .is_empty());
 
         // inline-only child schema (imx pinctrl shape)
-        let hints = bindings.child_properties_for(&["vendor,pctl".to_string()], "uart1grp");
+        let hints = bindings.child_properties_for(
+            &["vendor,pctl".to_string()],
+            &["uart1grp".to_string()],
+        );
         assert!(hints.contains_key("fsl,pins"));
         assert!(bindings
-            .child_properties_for(&["vendor,pctl".to_string()], "somewhere-else")
+            .child_properties_for(
+                &["vendor,pctl".to_string()],
+                &["somewhere-else".to_string()],
+            )
             .is_empty());
     }
 
@@ -1044,8 +1291,320 @@ patternProperties:
 
         // depth-one ref expansion cannot loop; indexing terminates
         let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
-        let hints = bindings.child_properties_for(&["vendor,a".to_string()], "a-child");
+        let hints =
+            bindings.child_properties_for(&["vendor,a".to_string()], &["a-child".to_string()]);
         assert!(hints.contains_key("b-marker"));
+    }
+
+    #[test]
+    pub fn classifier_marks_node_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("classy.yaml"),
+            r#"
+$defs:
+  status-def:
+    type: string
+    enum: [ okay, disabled, reserved ]
+properties:
+  compatible:
+    const: vendor,classy
+  ports:
+    type: object
+    properties:
+      '#address-cells': true
+  reg:
+    type: array
+  status: true
+  port-count:
+    $ref: '#/$defs/status-def'
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let hints = bindings.properties_for(&["vendor,classy".to_string()]);
+        // node-like by INLINE markers only; scalars, booleans and
+        // ref-only leaves stay property-shaped
+        assert!(hints["ports"].child_object);
+        assert!(!hints["reg"].child_object);
+        assert!(!hints["status"].child_object);
+        assert!(!hints["port-count"].child_object);
+        // the classified fixed-name child walks; scalar properties do not
+        let kids = bindings.child_properties_for(
+            &["vendor,classy".to_string()],
+            &["ports".to_string()],
+        );
+        assert!(kids.contains_key("#address-cells"));
+        assert!(bindings
+            .child_properties_for(&["vendor,classy".to_string()], &["reg".to_string()])
+            .is_empty());
+    }
+
+    #[test]
+    pub fn numeric_enum_values_complete_as_strings() {
+        let mut bindings = Bindings::default();
+        let yaml: Value = serde_yaml::from_str(
+            r#"
+properties:
+  compatible:
+    const: vendor,bus
+  bus-type:
+    enum: [4, 5, 6]
+"#,
+        )
+        .unwrap();
+        bindings.add_schema(PathBuf::from("bus.yaml"), &yaml);
+        let hints = bindings.properties_for(&["vendor,bus".to_string()]);
+        assert_eq!(
+            hints["bus-type"].values,
+            vec!["4".to_string(), "5".to_string(), "6".to_string()]
+        );
+    }
+
+    #[test]
+    pub fn grandchild_paths_walk_full_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("graph.yaml"),
+            r#"
+$defs:
+  endpoint-base:
+    properties:
+      reg: true
+      remote-endpoint: true
+  port-base:
+    properties:
+      '#address-cells':
+        const: 1
+      reg: true
+      endpoint:
+        type: object
+        properties:
+          dual-lane: true
+    patternProperties:
+      '^endpoint(@[0-9a-f]+)?$':
+        $ref: '#/$defs/endpoint-base'
+properties:
+  ports:
+    type: object
+    properties:
+      '#address-cells':
+        const: 1
+      '#size-cells':
+        const: 0
+    patternProperties:
+      '^port@[0-9a-f]+$':
+        $ref: '#/$defs/port-base'
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("sfc.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,sfc
+  ports:
+    $ref: graph.yaml#/properties/ports
+    properties:
+      port@0:
+        $ref: graph.yaml#/$defs/port-base
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let compat = &["vendor,sfc".to_string()];
+
+        // level 1: the ports child's own properties, not its children's
+        let hints = bindings.child_properties_for(compat, &["ports".to_string()]);
+        assert!(hints.contains_key("#address-cells"));
+        assert!(hints.contains_key("#size-cells"));
+        assert!(!hints.contains_key("reg"));
+
+        // level 2: sfc's fixed-name port@0 and graph's ^port@…$ pattern
+        // both reach port-base; the inline-marker endpoint flags node-like
+        for port in ["port@0", "port@1"] {
+            let hints = bindings.child_properties_for(
+                compat,
+                &["ports".to_string(), port.to_string()],
+            );
+            assert!(hints.contains_key("reg"));
+            assert!(hints["endpoint"].child_object);
+        }
+
+        // level 3: endpoint matches BOTH the classified fixed-name
+        // (^endpoint$) and the graph pattern (^endpoint(@…)?$) — both
+        // final matches' properties merge
+        let hints = bindings.child_properties_for(
+            compat,
+            &[
+                "ports".to_string(),
+                "port@0".to_string(),
+                "endpoint".to_string(),
+            ],
+        );
+        assert!(hints.contains_key("remote-endpoint"));
+        assert!(hints.contains_key("dual-lane"));
+
+        // dead ends: names matching nothing, walking below a leaf level
+        assert!(bindings
+            .child_properties_for(
+                compat,
+                &["ports".to_string(), "clock@0".to_string()],
+            )
+            .is_empty());
+        assert!(bindings
+            .child_properties_for(
+                compat,
+                &[
+                    "ports".to_string(),
+                    "port@0".to_string(),
+                    "endpoint".to_string(),
+                    "deeper".to_string(),
+                ],
+            )
+            .is_empty());
+    }
+
+    #[test]
+    pub fn recursive_ref_cycles_terminate_via_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("cyc-a.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,cyc-a
+  a-marker: true
+patternProperties:
+  '^a-':
+    $ref: cyc-b.yaml#
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("cyc-b.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,cyc-b
+  b-marker: true
+patternProperties:
+  '^b-':
+    $ref: cyc-a.yaml#
+"#,
+        )
+        .unwrap();
+
+        // indexing the mutually-recursive pair terminates (visited-stack
+        // guard over ring entries + depth cap); the chain stays walkable
+        // and the guard flattens the cycle past the second ring
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let compat = &["vendor,cyc-a".to_string()];
+        let hints = bindings.child_properties_for(compat, &["a-x".to_string()]);
+        assert!(hints.contains_key("b-marker"));
+        let ring2 = bindings.child_properties_for(
+            compat,
+            &["a-x".to_string(), "b-y".to_string()],
+        );
+        assert!(ring2.contains_key("a-marker"));
+        assert!(bindings
+            .child_properties_for(
+                compat,
+                &["a-x".to_string(), "b-y".to_string(), "a-z".to_string()],
+            )
+            .contains_key("b-marker"));
+        assert!(bindings
+            .child_properties_for(
+                compat,
+                &[
+                    "a-x".to_string(),
+                    "b-y".to_string(),
+                    "a-z".to_string(),
+                    "b-w".to_string(),
+                ],
+            )
+            .is_empty());
+    }
+
+    #[test]
+    pub fn root_relative_refs_resolve_across_binding_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let schemas = dir.path().join("schemas");
+        fs::create_dir_all(&schemas).unwrap();
+        fs::write(
+            schemas.join("graph-root.yaml"),
+            r#"
+$defs:
+  endpoint-base:
+    properties:
+      reg: true
+      remote-endpoint: true
+  port-base:
+    properties:
+      reg: true
+    patternProperties:
+      '^endpoint@[0-9a-f]+$':
+        $ref: '#/$defs/endpoint-base'
+properties:
+  ports:
+    type: object
+    patternProperties:
+      '^port@[0-9a-f]+$':
+        $ref: '#/$defs/port-base'
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("sfc-root.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,sfcroot
+  ports:
+    $ref: /schemas/graph-root.yaml#/properties/ports
+"#,
+        )
+        .unwrap();
+
+        // in-tree layout: `$ref: /schemas/…` resolves under the binding
+        // root carrying a schemas/ subdir
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let compat = &["vendor,sfcroot".to_string()];
+        let port = bindings.child_properties_for(
+            compat,
+            &["ports".to_string(), "port@1".to_string()],
+        );
+        assert!(port.contains_key("reg"));
+        let endpoint = bindings.child_properties_for(
+            compat,
+            &[
+                "ports".to_string(),
+                "port@1".to_string(),
+                "endpoint@0".to_string(),
+            ],
+        );
+        assert!(endpoint.contains_key("remote-endpoint"));
+
+        // dtschema pip layout: the registered root IS the schemas dir —
+        // the schemas/ prefix strips before joining
+        fs::write(
+            schemas.join("sfc-pip.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,sfcpip
+  ports:
+    $ref: /schemas/graph-root.yaml#/properties/ports
+"#,
+        )
+        .unwrap();
+        let pip = Bindings::from_paths(&[schemas]);
+        let port = pip.child_properties_for(
+            &["vendor,sfcpip".to_string()],
+            &["ports".to_string(), "port@0".to_string()],
+        );
+        assert!(port.contains_key("reg"));
     }
 
     #[test]
