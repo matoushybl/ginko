@@ -28,6 +28,10 @@ pub struct Backend {
     bindings: Bindings,
     include_paths: Vec<PathBuf>,
     header_define_cache: RwLock<HashMap<PathBuf, Arc<Vec<Define>>>>,
+    /// The URIs each project file is open under. A file can be open under
+    /// several spellings (symlinks — e.g. dts/imx8mm.dtsi into the kernel
+    /// checkout); diagnostics publish to every spelling.
+    open_uris: RwLock<HashMap<PathBuf, Vec<Url>>>,
 }
 
 impl Backend {
@@ -41,6 +45,7 @@ impl Backend {
             bindings: Bindings::default(),
             include_paths: Vec::new(),
             header_define_cache: RwLock::new(HashMap::new()),
+            open_uris: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -180,6 +185,8 @@ impl Backend {
             .files()
             .map(|file| file.to_owned())
             .collect_vec();
+        // snapshot: the guard must not live across the publish awaits
+        let open_uris = self.open_uris.read().clone();
         for file in file_paths {
             let diagnostics = self
                 .project
@@ -187,9 +194,22 @@ impl Backend {
                 .get_diagnostics(&file)
                 .map(|diag| self.lsp_diag_from_diag(diag))
                 .collect_vec();
-            self.client
-                .publish_diagnostics(Url::from_file_path(&file).unwrap(), diagnostics, None)
-                .await
+            match open_uris.get(&file).filter(|uris| !uris.is_empty()) {
+                // spelled URIs registered at didOpen take precedence; the
+                // canonical URI may not match any client buffer (symlinks)
+                Some(uris) if !uris.is_empty() => {
+                    for uri in uris {
+                        self.client
+                            .publish_diagnostics(uri.clone(), diagnostics.clone(), None)
+                            .await;
+                    }
+                }
+                _ => {
+                    self.client
+                        .publish_diagnostics(Url::from_file_path(&file).unwrap(), diagnostics, None)
+                        .await;
+                }
+            }
         }
     }
 }
@@ -313,6 +333,14 @@ impl LanguageServer for Backend {
             file_type,
             &mut self.loader.write(),
         );
+        {
+            let key = fs::canonicalize(&file_path).unwrap_or(file_path);
+            let mut open_uris = self.open_uris.write();
+            let uris = open_uris.entry(key).or_default();
+            if !uris.contains(&params.text_document.uri) {
+                uris.push(params.text_document.uri.clone());
+            }
+        }
         self.publish_diagnostics().await
     }
 
@@ -332,7 +360,19 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {}
 
-    async fn did_close(&self, _: DidCloseTextDocumentParams) {}
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let Some(file_path) = self
+            .url_to_file_path(&params.text_document.uri)
+            .await
+        else {
+            return;
+        };
+        let key = fs::canonicalize(&file_path).unwrap_or(file_path);
+        let mut open_uris = self.open_uris.write();
+        if let Some(uris) = open_uris.get_mut(&key) {
+            uris.retain(|uri| uri != &params.text_document.uri);
+        }
+    }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         fn completions_for_reference(
