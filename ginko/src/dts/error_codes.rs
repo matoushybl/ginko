@@ -36,6 +36,7 @@ pub enum ErrorCode {
     UnknownMacro,
     CustomError,
     CustomWarning,
+    CustomHint,
 }
 
 /// The `SeverityMap` maps error codes to severities.
@@ -82,7 +83,8 @@ impl Default for SeverityMap {
             | UnexpectedFormat
             | DuplicateDirective
             | UnknownMacro
-            | CustomWarning => Severity::Warning
+            | CustomWarning => Severity::Warning,
+            CustomHint => Severity::Hint,
         };
         SeverityMap { inner: map }
     }

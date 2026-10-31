@@ -89,8 +89,24 @@ impl ResolvedNode {
         })
     }
 
+    /// The node's live children — for tree-wide passes (binding
+    /// diagnostics) walking the whole resolved view.
+    pub fn active_children<'a>(&'a self) -> impl Iterator<Item = &'a ResolvedNode> + use<'a> {
+        self.children
+            .iter()
+            .filter(|(_, child)| !child.deleted)
+            .map(|(_, child)| child)
+    }
+
     pub fn get_property(&self, name: &str) -> Option<&ResolvedProperty> {
         self.properties.get(name)
+    }
+
+    /// Whether the node carries a live child of exactly this name —
+    /// devicetree nodes double as properties, so a `required` entry can
+    /// be satisfied by a child node (rohm,bd71847's `regulators`).
+    pub fn child_exists(&self, name: &str) -> bool {
+        self.children.contains_key(&NodeName::from(name.to_string()))
     }
 
     pub fn active_child_properties<'a>(
@@ -141,6 +157,12 @@ pub struct ResolvedTree {
 }
 
 impl ResolvedTree {
+    /// The tree's root node — the entry point for tree-wide passes
+    /// (binding diagnostics).
+    pub fn root(&self) -> &ResolvedNode {
+        &self.root
+    }
+
     /// The deepest node whose definition in `file` spans `position` — the node
     /// a cursor at `position` is being written into. Node sources carry one
     /// span per defining file (base and overlay definitions), so this works

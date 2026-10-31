@@ -2,7 +2,7 @@ use ginko::dts::{
     AnyDirective, Bindings, CompletionContext, FileType, HasSpan, IncludeLoader,
     IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload,
     ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, ResolvedProperty, Severity,
-    SeverityMap, Span, merge_hint, node_compatibles,
+    SeverityMap, Span, binding_diagnostics, merge_hint, node_compatibles,
 };
 use ginko::header::{Define, TokenKind, parse_header};
 use itertools::Itertools;
@@ -239,12 +239,29 @@ impl Backend {
         // snapshot: the guard must not live across the publish awaits
         let open_uris = self.open_uris.read().clone();
         for file in file_paths {
-            let diagnostics = self
+            let mut diagnostics = self
                 .project
                 .read()
                 .get_diagnostics(&file)
                 .map(|diag| self.lsp_diag_from_diag(diag))
                 .collect_vec();
+            // binding-driven validation (conservative dtbs_check baseline);
+            // no-ops entirely when no bindings root is configured
+            if !self.bindings.is_empty() {
+                let binding_diags = self
+                    .project
+                    .read()
+                    .get_analysis(&file)
+                    .map(|analysis| {
+                        binding_diagnostics(analysis.get_resolved_tree(), &file, &self.bindings)
+                    })
+                    .unwrap_or_default();
+                diagnostics.extend(
+                    binding_diags
+                        .iter()
+                        .map(|diag| self.lsp_diag_from_diag(diag)),
+                );
+            }
             match open_uris.get(&file).filter(|uris| !uris.is_empty()) {
                 // spelled URIs registered at didOpen take precedence; the
                 // canonical URI may not match any client buffer (symlinks)

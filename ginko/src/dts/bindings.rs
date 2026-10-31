@@ -21,6 +21,24 @@ use serde_yaml::Value;
 use crate::dts::ast::PropertyValue;
 use crate::dts::resolved::ResolvedNode;
 
+/// One way a node's compatible list can satisfy a binding's
+/// `compatible` constraint — the DISJUNCTIVE-branch model: each
+/// `oneOf`/`anyOf` branch (or the single conjunctive shape, when
+/// there is none) yields one alternative. A node satisfies the
+/// binding when it satisfies one alternative: EVERY `const:` entry
+/// present, plus at least one `linked` enum value when the
+/// alternative has any (the `[enum-vendors, "syscon"]` positional
+/// shape). Alternatives without a const can never anchor a node —
+/// enum-only shapes stay suggestion-only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompatibleShape {
+    /// Every `const:` entry — a matching node must carry ALL of them.
+    pub consts: Vec<String>,
+    /// Positionally-linked `enum:` values of an `items:` sequence
+    /// that also pins a const — a matching node must carry one.
+    pub linked: Vec<String>,
+}
+
 /// A binding file distilled to completion data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionSchema {
@@ -30,6 +48,14 @@ pub struct CompletionSchema {
     pub properties: BTreeMap<String, PropertyHint>,
     /// Child-node schemas keyed by `patternProperties` patterns.
     pub children: Vec<ChildSchema>,
+    /// The compatible constraint as a DISJUNCTION of
+    /// `CompatibleShape` alternatives — one per `oneOf`/`anyOf`
+    /// branch; the parse tree of an unbranched constraint collapses
+    /// to a single alternative.
+    pub alternatives: Vec<CompatibleShape>,
+    /// All `enum:` values — index suggestion keys only; never a
+    /// constraint (completion keeps the v1 over-collection).
+    pub enums: Vec<String>,
 }
 
 /// A child-node schema: the `patternProperties` entries of a binding whose
@@ -85,10 +111,14 @@ pub struct Bindings {
     by_compatible: BTreeMap<String, Vec<usize>>,
     schemas: Vec<CompletionSchema>,
     /// Property hints from compatible-less common-part schemas ($ref'ed
-    /// property sets like leds/common.yaml or dt-schema's status.yaml).
-    /// Consulted for VALUE completion only — their property names are
-    /// deliberately not suggested universally.
+    /// property sets like leds/common.yaml, rk3399-pcie-common style
+    /// fragments). SUGGESTION-ONLY for completion — never normative for
+    /// validation.
     common: BTreeMap<String, PropertyHint>,
+    /// Property hints from `select: true` schemas — dtschema's dt-core,
+    /// applicable to EVERY node. Normative: the validation counterpart of
+    /// the suggestion pools.
+    universal: BTreeMap<String, PropertyHint>,
     /// Neighbor schema files pulled in by patternProperties `$ref`s,
     /// parsed once per absolute path.
     ref_cache: HashMap<PathBuf, Value>,
@@ -120,8 +150,86 @@ impl Bindings {
         self.schemas.len()
     }
 
+    /// Whether any binding data was indexed — completion hints and
+    /// binding-driven validators no-op when false.
+    pub fn is_empty(&self) -> bool {
+        self.schemas.is_empty() && self.common.is_empty() && self.universal.is_empty()
+    }
+
     pub fn compatible_count(&self) -> usize {
         self.by_compatible.len()
+    }
+
+    /// Property hints merged ONLY from schemas whose compatible
+    /// constraint the node's full compatible list ACCEPTS — the
+    /// VALIDATION counterpart of `properties_for`. Completion over-collects
+    /// by any-shared-string (a `syscon` sibling binding suggests its
+    /// properties); requirements must come from bindings that genuinely
+    /// accept the node.
+    pub fn normative_properties_for(
+        &self,
+        compatibles: &[String],
+    ) -> BTreeMap<String, PropertyHint> {
+        let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
+        for compatible in compatibles {
+            for idx in self.by_compatible.get(compatible).into_iter().flatten() {
+                if !self.schema_accepts(*idx, compatibles) {
+                    continue;
+                }
+                for (name, hint) in &self.schemas[*idx].properties {
+                    merge_hint(merged.entry(name.clone()).or_default(), hint);
+                }
+            }
+        }
+        merged
+    }
+
+    /// Whether a node's compatible list satisfies schema `idx`'s
+    /// compatible constraint — the DISJUNCTIVE model: the node must
+    /// satisfy ONE alternative (every const of the alternative plus,
+    /// where it pins any, one linked enum). Alternatives without a
+    /// const anchor (pattern/contains/enum-only shapes — exactly the
+    /// syscon-impostor leak family: `qcom,gcc-apq8064.yaml`'s bare
+    /// `- const: syscon` branch once pooled into a global consts list
+    /// and judged every syscon node) never impose requirements —
+    /// their match semantics exceed this round's approximation;
+    /// `properties_for` still over-collects their hints for completion.
+    pub fn schema_accepts(&self, idx: usize, compatibles: &[String]) -> bool {
+        self.schemas[idx].alternatives.iter().any(|alt| {
+            !alt.consts.is_empty()
+                && alt.consts.iter().all(|crit| compatibles.contains(crit))
+                && (alt.linked.is_empty()
+                    || alt.linked.iter().any(|link| compatibles.contains(link)))
+        })
+    }
+
+    /// The NORMATIVE schemas matching a node's compatible list — one
+    /// entry per ACCEPTED binding, carrying the binding's identifier
+    /// (its file stem) for diagnostic attribution and its merged
+    /// property hints. A node's requirements are judged per binding:
+    /// required-missing messages name the imposing binding.
+    pub fn normative_views(
+        &self,
+        compatibles: &[String],
+    ) -> Vec<(String, &BTreeMap<String, PropertyHint>)> {
+        let mut out = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for compatible in compatibles {
+            for &idx in self.by_compatible.get(compatible).into_iter().flatten() {
+                if seen.contains(&idx) || !self.schema_accepts(idx, compatibles) {
+                    continue;
+                }
+                seen.push(idx);
+                let name = self.schemas[idx]
+                    .file
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("unknown binding")
+                    .to_string();
+                out.push((name, &self.schemas[idx].properties));
+            }
+        }
+        out
     }
 
     /// Merge the property hints of all schemas matching any of the given
@@ -157,8 +265,14 @@ impl Bindings {
             self.add_common_schema(binding, &file);
             return;
         };
-        let mut compatibles = Vec::new();
-        collect_compatible_strings(compatible, &mut compatibles);
+        let mut keys = Vec::new();
+        let alternatives = collect_compatible_shapes(compatible, &mut keys);
+        let mut compatibles = keys.clone();
+        for alt in &alternatives {
+            compatibles.extend(alt.consts.iter().cloned());
+            compatibles.extend(alt.linked.iter().cloned());
+        }
+
         compatibles.sort();
         compatibles.dedup();
         if compatibles.is_empty() {
@@ -194,6 +308,8 @@ impl Bindings {
             file,
             properties,
             children,
+            alternatives,
+            enums: keys,
         });
         let idx = self.schemas.len() - 1;
         for compatible in compatibles {
@@ -204,22 +320,46 @@ impl Bindings {
         }
     }
 
-    /// Hints from common-part schemas merge by property name; their value
-    /// candidates dedupe across files. See `common`.
+    /// Hints from common-part schemas merge by property name; `select:
+    /// true` schemas (dtschema's dt-core) are UNIVERSAL — normative for
+    /// every node — while compatible-less fragments stay suggestion-only.
+    /// See `common` and `universal`.
     fn add_common_schema(&mut self, binding: &Value, file: &Path) {
+        let universal = matches!(binding.get("select"), Some(Value::Bool(true)));
         for (view, _) in flat_views(binding, file, &mut self.ref_cache, &self.roots) {
             for (name, hint) in extract_properties(&view) {
-                merge_hint(self.common.entry(name.clone()).or_default(), &hint);
+                let target = if universal {
+                    &mut self.universal
+                } else {
+                    &mut self.common
+                };
+                merge_hint(target.entry(name.clone()).or_default(), &hint);
             }
         }
     }
 
     /// Value candidates for a property from common-part schemas — matched by
-    /// property name, e.g. `status` from dt-schema's status.yaml or `color`
+    /// property name, e.g. `status` from dt-schema's dt-core or `color`
     /// from leds/common.yaml. Called when the node's own bindings have no
     /// candidates for the property.
     pub fn common_values(&self, name: &str) -> &[String] {
         self.common
+            .get(name)
+            .map(|hint| hint.values.as_slice())
+            .filter(|values| !values.is_empty())
+            .or_else(|| {
+                self.universal
+                    .get(name)
+                    .map(|hint| hint.values.as_slice())
+            })
+            .unwrap_or(&[])
+    }
+
+    /// Value candidates from `select: true` schemas alone — authoritative
+    /// for every node (dtschema applies dt-core regardless of binding); the
+    /// VALIDATION counterpart of `common_values`.
+    pub fn universal_values(&self, name: &str) -> &[String] {
+        self.universal
             .get(name)
             .map(|hint| hint.values.as_slice())
             .unwrap_or(&[])
@@ -343,44 +483,174 @@ fn extract_properties(binding: &Value) -> BTreeMap<String, PropertyHint> {
     properties
 }
 
-fn collect_compatible_strings(value: &Value, out: &mut Vec<String>) {
+/// The compatible constraint of a schema, parsed into a DISJUNCTION of
+/// `CompatibleShape` alternatives plus free `enum:` suggestion keys:
+/// - a `oneOf`/`anyOf` contributes one alternative per branch — a
+///   node matching ANY branch matches the schema, so branch consts
+///   must never pool (a bare `- const: syscon` branch is one match
+///   path, not a global requirement);
+/// - an `items:` position sequence pins its `const:` positions and
+///   positionally LINKS its enum positions when at least one const is
+///   pinned (the `[enum-vendors, "syscon"]` shape) — const-less
+///   sequences stay suggestion-only;
+/// - `contains:` and free `enum:` hints contribute suggestion keys
+///   but never constraints (an expansion-bus binding must not impose
+///   on every syscon node).
+///
+/// A nested disjunction under `allOf` merges conjunctively — a
+/// conservative approximation not seen in real bindings.
+fn collect_compatible_shapes(
+    value: &Value,
+    keys: &mut Vec<String>,
+) -> Vec<CompatibleShape> {
     match value {
+        Value::Sequence(items) => {
+            // a sequence of alternatives — treated as oneOf
+            let mut alternatives = Vec::new();
+            for item in items {
+                alternatives.extend(collect_compatible_shapes(item, keys));
+            }
+            alternatives
+        }
         Value::Mapping(map) => {
+            let mut accum = CompatibleShape::default();
+            let mut branches = Vec::new();
             for (key, val) in map.iter() {
                 match key.as_str() {
+                    Some("const") => {
+                        if let Some(string) = val.as_str() {
+                            accum.consts.push(string.to_string());
+                        }
+                    }
                     Some("enum") => {
                         if let Value::Sequence(items) = val {
                             for item in items {
                                 if let Some(string) = item.as_str() {
-                                    out.push(string.to_string());
+                                    keys.push(string.to_string());
                                 }
                             }
                         }
                     }
-                    Some("const") => {
-                        if let Some(string) = val.as_str() {
-                            out.push(string.to_string());
+                    Some("items") => {
+                        if let Value::Sequence(items) = val {
+                            let mut seq_consts = Vec::new();
+                            let mut seq_enums = Vec::new();
+                            for item in items {
+                                collect_item_position(item, &mut seq_consts, &mut seq_enums);
+                            }
+                            accum.consts.extend(seq_consts.iter().cloned());
+                            if seq_consts.is_empty() {
+                                keys.extend(seq_enums);
+                            } else {
+                                accum.linked.extend(seq_enums.iter().cloned());
+                                keys.extend(seq_enums);
+                            }
                         }
                     }
-                    // `oneOf`, `items`, `contains`, …
-                    _ => collect_compatible_strings(val, out),
+                    Some("oneOf" | "anyOf") => {
+                        if let Value::Sequence(one_of) = val {
+                            for one in one_of {
+                                branches.extend(collect_compatible_shapes(one, keys));
+                            }
+                        }
+                    }
+                    Some("allOf") => {
+                        // conjunctive: merge every member into every
+                        // pending frame (nested disjunctions merge
+                        // wholesale — see the doc comment above)
+                        if let Value::Sequence(members) = val {
+                            for member in members {
+                                for alt in collect_compatible_shapes(member, keys) {
+                                    if branches.is_empty() {
+                                        accum.consts.extend(alt.consts);
+                                        accum.linked.extend(alt.linked);
+                                    } else {
+                                        for frame in &mut branches {
+                                            frame.consts.extend(alt.consts.iter().cloned());
+                                            frame.linked.extend(alt.linked.iter().cloned());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("contains") => {
+                        // an "at least one member" hint: suggestion keys
+                        // only, never a constraint
+                        collect_compatible_shapes(val, keys);
+                    }
+                    _ => {
+                        // $ref descendants and other wrappers: recurse
+                        // conjunctively into the shared frame
+                        for alt in collect_compatible_shapes(val, keys) {
+                            if branches.is_empty() {
+                                accum.consts.extend(alt.consts);
+                                accum.linked.extend(alt.linked);
+                            } else {
+                                for frame in &mut branches {
+                                    frame.consts.extend(alt.consts.iter().cloned());
+                                    frame.linked.extend(alt.linked.iter().cloned());
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
-        Value::Sequence(items) => {
-            for item in items {
-                collect_compatible_strings(item, out);
+            if branches.is_empty() {
+                return if accum.consts.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![accum]
+                };
             }
+            if !accum.consts.is_empty() {
+                // a const pinned beside a disjunction conjoins with
+                // every branch — stricter (safe) direction
+                for frame in &mut branches {
+                    frame.consts.extend(accum.consts.iter().cloned());
+                    frame.linked.extend(accum.linked.iter().cloned());
+                }
+            }
+            branches
         }
-        _ => {}
+        _ => Vec::new(),
+    }
+}
+
+/// One `items:` position of a compatible sequence — either a pinned
+/// `const:` or an `enum:` alternative slot.
+fn collect_item_position(item: &Value, consts: &mut Vec<String>, enums: &mut Vec<String>) {
+    let Value::Mapping(map) = item else {
+        return;
+    };
+    for (key, val) in map.iter() {
+        match key.as_str() {
+            Some("const") => {
+                if let Some(string) = val.as_str() {
+                    consts.push(string.to_string());
+                }
+            }
+            Some("enum") => {
+                if let Value::Sequence(items) = val {
+                    for item in items {
+                        if let Some(string) = item.as_str() {
+                            enums.push(string.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 fn property_hint(sub: &Value, required: bool) -> PropertyHint {
-    if let Value::Bool(boolean) = sub {
+    if matches!(sub, Value::Bool(_)) {
+        // `name: true` means allowed-unconstrained in dtschema, NOT a
+        // boolean property (fixed-regulator's `regulator-name: true`) —
+        // booleans are spelled `{type: boolean}`
         return PropertyHint {
             required,
-            boolean: *boolean,
             ..PropertyHint::default()
         };
     }
@@ -393,12 +663,15 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
     let type_hint = sub.get("$ref").and_then(Value::as_str).and_then(type_ref_tail);
     let description = sub.get("description").and_then(Value::as_str).map(str::to_string);
     let deprecated = matches!(sub.get("deprecated"), Some(Value::Bool(true)));
+    // the kernel-idiomatic boolean spelling: `name: {type: boolean}`
+    // (the bare `name: true` is handled above)
+    let boolean = sub.get("type").and_then(Value::as_str) == Some("boolean");
     let define_families = define_families_from(description.as_deref());
     let mut values = Vec::new();
     collect_value_strings(sub, &mut values);
     PropertyHint {
         required,
-        boolean: false,
+        boolean,
         type_hint,
         description,
         deprecated,
@@ -1076,7 +1349,9 @@ properties:
         );
 
         let wakeup = &properties["wakeup-source"];
-        assert!(wakeup.boolean);
+        // `name: true` = allowed-unconstrained in dtschema, NOT boolean —
+        // real booleans are spelled `{type: boolean}`
+        assert!(!wakeup.boolean);
         assert!(!wakeup.required);
 
         let interrupts = &properties["interrupts"];
@@ -1704,7 +1979,9 @@ properties:
         let top = bindings.properties_for(compat);
         assert!(top.contains_key("label"));
         assert!(top.contains_key("rotation"));
-        assert!(top["panel-timing"].boolean);
+        // panel-dpi's `panel-timing: true` = allowed-unconstrained (the
+        // common part carries the real constraint) — not a boolean
+        assert!(!top["panel-timing"].boolean);
 
         // the common part's panel-timing classifies as a child and its
         // bare-wrapper chain ($ref -> $ref -> $defs/timing) chases to the
