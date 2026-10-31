@@ -408,28 +408,23 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
     }
 }
 
-/// Bindings prose convention: "Use one of the LED_COLOR_ID_* prefixed
-/// definitions from the header include/dt-bindings/leds/common.h." Extract
-/// the uppercase `_`-suffixed token(s) starred via `*` in such descriptions
-/// and map each family prefix to the first `include/…h` path mention;
-/// descriptions without a header mention yield nothing.
+/// Bindings prose conventions that point completion at a header's defines.
+/// Starred uppercase families ("Use one of the LED_COLOR_ID_* prefixed
+/// definitions … include/dt-bindings/leds/common.h.") map each `X_*`
+/// prefix to the first plain `…h` path mention. An angle-bracketed header
+/// mention without a starred family ("… macro, which can be found in
+/// <arch/…/imx8m[m,n,p,q]-pinfunc.h>.", fsl,imx8m-pinctrl prose) names a
+/// whole-header family keyed by the empty prefix: every `#define` of that
+/// header is a candidate. Descriptions without a header mention yield
+/// nothing.
 fn define_families_from(description: Option<&str>) -> BTreeMap<String, String> {
     let Some(description) = description else {
         return BTreeMap::new();
     };
-    let Some(start) = description.find("include/") else {
-        return BTreeMap::new();
-    };
-    let rest = &description[start..];
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let header = rest[..end]
-        .trim_end_matches(['.', ',', ';'])
-        .to_string();
-    if !header.ends_with(".h") || header == ".h" {
-        return BTreeMap::new();
-    }
+
+    // starred uppercase family tokens: `LED_COLOR_ID_*`
     let bytes = description.as_bytes();
-    let mut families = BTreeMap::new();
+    let mut starred: Vec<String> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i].is_ascii_uppercase() {
@@ -444,11 +439,58 @@ fn define_families_from(description: Option<&str>) -> BTreeMap<String, String> {
             }
             let token = &description[start..i];
             if i < bytes.len() && bytes[i] == b'*' && token.ends_with('_') {
-                families.insert(token.to_string(), header.clone());
+                starred.push(token.to_string());
             }
         } else {
             i += 1;
         }
+    }
+
+    // header mentions: path-ish tokens ending `.h` (trailing punctuation
+    // trimmed), split by whether the prose angle-brackets them
+    let is_path_char = |c: char| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | '[' | ']' | ',')
+    };
+    let mut plain_headers: Vec<String> = Vec::new();
+    let mut angle_headers: Vec<String> = Vec::new();
+    let mut start = None;
+    for (idx, c) in description.char_indices() {
+        if is_path_char(c) {
+            if start.is_none() {
+                start = Some(idx);
+            }
+        } else if let Some(begin) = start.take() {
+            let token = description[begin..idx].trim_end_matches(['.', ',']);
+            if token.ends_with(".h") && token.len() > 2 {
+                if description[..begin].ends_with('<') {
+                    angle_headers.push(token.to_string());
+                } else {
+                    plain_headers.push(token.to_string());
+                }
+            }
+        }
+    }
+    if let Some(begin) = start {
+        let token = description[begin..].trim_end_matches(['.', ',', '>']);
+        if token.ends_with(".h") && token.len() > 2 {
+            if description[..begin].ends_with('<') {
+                angle_headers.push(token.to_string());
+            } else {
+                plain_headers.push(token.to_string());
+            }
+        }
+    }
+
+    let mut families = BTreeMap::new();
+    if !starred.is_empty() {
+        if let Some(header) = plain_headers.first() {
+            for family in starred {
+                families.insert(family, header.clone());
+            }
+        }
+    } else if let Some(header) = angle_headers.first() {
+        // whole-header family: no prefix filters its defines
+        families.insert(String::new(), header.clone());
     }
     families
 }
@@ -1171,8 +1213,56 @@ there is no matching LED_COLOR_ID available, add a new one.";
         );
 
         assert!(define_families_from(Some("a plain description")).is_empty());
-        assert!(define_families_from(Some("mentions LED_COLOR_ID_* but no header")).is_empty());
+        assert!(define_families_from(Some("touches include/dt-bindings/x.h but no starred family")).is_empty());
         assert!(define_families_from(None).is_empty());
+
+        // angle-bracketed header mentions without a starred family name a
+        // whole-header family (fsl,imx8m-pinctrl prose shape)
+        let pinfunc_desc = "each entry consists of 6 integers. The first 5 \
+integers are specified using a PIN_FUNC_ID macro, which can be found in \
+<arch/arm64/boot/dts/freescale/imx8m[m,n,p,q]-pinfunc.h>.";
+        let families = define_families_from(Some(pinfunc_desc));
+        assert_eq!(families.len(), 1);
+        assert_eq!(
+            families.get("").map(String::as_str),
+            Some("arch/arm64/boot/dts/freescale/imx8m[m,n,p,q]-pinfunc.h")
+        );
+    }
+
+    #[test]
+    pub fn whole_header_families_reach_pinctrl_children() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("iomux.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,iomux
+patternProperties:
+  'grp$':
+    type: object
+    properties:
+      fsl,pins:
+        description: |
+          each entry consists of 6 integers. The first 5 integers
+          <mux_reg conf_reg input_reg mux_val input_val> are specified using
+          a PIN_FUNC_ID macro, which can be found in
+          <arch/arm64/boot/dts/freescale/imx8m[m,n,p,q]-pinfunc.h>.
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+"#,
+        )
+        .unwrap();
+
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let hints = bindings.child_properties_for(
+            &["vendor,iomux".to_string()],
+            &["uart1grp".to_string()],
+        );
+        let pins = hints.get("fsl,pins").expect("fsl,pins hinted in groups");
+        assert_eq!(
+            pins.define_families.get("").map(String::as_str),
+            Some("arch/arm64/boot/dts/freescale/imx8m[m,n,p,q]-pinfunc.h")
+        );
     }
 
     #[test]

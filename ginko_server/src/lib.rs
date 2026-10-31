@@ -113,31 +113,81 @@ impl Backend {
         self
     }
 
-    /// Resolve a relative header path named by a binding description (e.g.
-    /// `include/dt-bindings/leds/common.h`) under the configured include
-    /// paths and scan it once for `#define`s. The scanned defines are cached
-    /// per resolved file for the session.
-    fn header_defines(&self, relative: &str) -> Option<Arc<Vec<Define>>> {
-        let resolved = self.include_paths.iter().find_map(|root| {
-            let direct = root.join(relative);
-            let stripped = relative
-                .strip_prefix("include/")
-                .map(|rest| root.join(rest));
-            std::iter::once(&direct)
-                .chain(stripped.iter())
-                .find(|candidate| candidate.exists())
-                .cloned()
-        })?;
+    /// Resolve a header path named by a binding description (e.g.
+    /// `include/dt-bindings/leds/common.h`, or fsl,imx8m-pinctrl's
+    /// `<arch/…/imx8m[m,n,p,q]-pinfunc.h>`) and scan it once for
+    /// `#define`s. Candidates, in order: the `--include` roots (as-is,
+    /// then minus a leading `include/`), then the completing file's own
+    /// directory by bare filename — the dts convention for adjacent
+    /// headers, `#include "imx8mm-pinfunc.h"`. Bracket alternative
+    /// lists expand per alternative. Cached per resolved path:
+    /// returns the defines and the resolved path (the include spelling
+    /// needs it).
+    fn header_defines(
+        &self,
+        relative: &str,
+        dts_file: &Path,
+    ) -> Option<(Arc<Vec<Define>>, PathBuf)> {
+        let candidates: Vec<PathBuf> = Self::expand_alternatives(relative)
+            .into_iter()
+            .flat_map(|variant| -> Vec<PathBuf> {
+                let mut out: Vec<PathBuf> = self
+                    .include_paths
+                    .iter()
+                    .flat_map(|root| {
+                        let direct = root.join(&variant);
+                        let stripped = variant
+                            .strip_prefix("include/")
+                            .map(|rest| root.join(rest));
+                        std::iter::once(direct).chain(stripped)
+                    })
+                    .collect();
+                let adjacent = Path::new(&variant).file_name().and_then(|name| {
+                    dts_file.parent().map(|dir| dir.join(name))
+                });
+                out.extend(adjacent);
+                out
+            })
+            .collect();
+        let resolved = candidates.into_iter().find(|candidate| candidate.exists())?;
         if let Some(defines) = self.header_define_cache.read().get(&resolved) {
-            return Some(defines.clone());
+            return Some((defines.clone(), resolved));
         }
         let text = fs::read_to_string(&resolved).ok()?;
         let source = Arc::from(resolved.as_path());
         let defines = Arc::new(parse_header(&text, source).defines);
         self.header_define_cache
             .write()
-            .insert(resolved, defines.clone());
-        Some(defines)
+            .insert(resolved.clone(), defines.clone());
+        Some((defines, resolved))
+    }
+
+    /// Expand bracket alternative lists in a header mention:
+    /// `imx8m[m,n,p,q]-pinfunc.h` becomes one variant per SoC. Bracket
+    /// groups without a comma (character classes like `[0-9a-f]`) and
+    /// bracket-less mentions stay as-is.
+    fn expand_alternatives(mention: &str) -> Vec<String> {
+        let Some(open) = mention.find('[') else {
+            return vec![mention.to_string()];
+        };
+        let Some(close) = mention[open..].find(']').map(|i| open + i) else {
+            return vec![mention.to_string()];
+        };
+        let inner = &mention[open + 1..close];
+        if !inner.contains(',') {
+            return vec![mention.to_string()];
+        }
+        inner
+            .split(',')
+            .map(|alternative| {
+                format!(
+                    "{}{}{}",
+                    &mention[..open],
+                    alternative,
+                    &mention[close + 1..]
+                )
+            })
+            .collect()
     }
 
     pub fn with_parser_config(self, config: ParserConfig) -> Self {
@@ -630,7 +680,7 @@ impl LanguageServer for Backend {
             }
             let mut seen: BTreeSet<String> = BTreeSet::new();
             for (prefix, header) in define_prefixes {
-                let Some(defines) = this.header_defines(header) else {
+                let Some((defines, resolved)) = this.header_defines(header, file_path) else {
                     continue;
                 };
                 // A representative candidate decides whether the family's
@@ -644,12 +694,16 @@ impl LanguageServer for Backend {
                     (!define.fn_like && label.starts_with(prefix)).then(|| label.clone())
                 });
                 let include_edit = representative.and_then(|representative| {
-                    additional_include_edit(
-                        project,
-                        file_path,
-                        &representative,
-                        &dts_include_path(header),
-                    )
+                    // include spelling: headers under the --include roots
+                    // as <dt-bindings/…>; name-adjacent headers (pinfunc
+                    // style) quoted by bare filename
+                    let include_line = if header.starts_with("include/") {
+                        format!("#include <{}>", dts_include_path(header))
+                    } else {
+                        let file_name = resolved.file_name()?;
+                        format!("#include \"{}\"", file_name.to_string_lossy())
+                    };
+                    additional_include_edit(project, file_path, &representative, &include_line)
                 });
                 for define in defines.iter() {
                     if define.fn_like {
@@ -658,6 +712,10 @@ impl LanguageServer for Backend {
                     let TokenKind::Ident(label) = &define.name.kind else {
                         continue;
                     };
+                    // include guards and internals are not dts content
+                    if label.starts_with("__") {
+                        continue;
+                    }
                     if !label.starts_with(prefix) || !seen.insert(label.clone()) {
                         continue;
                     }
@@ -679,19 +737,20 @@ impl LanguageServer for Backend {
         fn dts_include_path(relative: &str) -> String {
             relative
                 .strip_prefix("include/")
-            .unwrap_or(relative)
+                .unwrap_or(relative)
                 .to_string()
         }
 
         /// The `#include <…>` TextEdit to attach to header-define completion
         /// items when the family's defines are not yet in scope for the
         /// completed file. None when an already-included header (directly or
-        /// transitively) provides the defines.
+        /// transitively) provides the defines. `include_line` is the full
+        /// statement to insert (`#include <…>` or `#include "…"`).
         fn additional_include_edit(
             project: &Project,
             file_path: &Path,
             representative_define: &str,
-            include_path: &str,
+            include_line: &str,
         ) -> Option<TextEdit> {
             if project
                 .get_analysis(file_path)
@@ -704,7 +763,7 @@ impl LanguageServer for Backend {
             let line = include_insert_line(source);
             Some(TextEdit {
                 range: Range::new(Position::new(line, 0), Position::new(line, 0)),
-                new_text: format!("#include <{include_path}>\n"),
+                new_text: format!("{include_line}\n"),
             })
         }
 
