@@ -154,7 +154,7 @@ impl Bindings {
         else {
             // Schemas without a `compatible` are common-part schemas; they
             // contribute value candidates instead of matching nodes.
-            self.add_common_schema(binding);
+            self.add_common_schema(binding, &file);
             return;
         };
         let mut compatibles = Vec::new();
@@ -168,17 +168,26 @@ impl Bindings {
             // schemas without `select: true` only match on their pattern —
             // they stay unused, as before.
             if matches!(binding.get("select"), Some(Value::Bool(true))) {
-                self.add_common_schema(binding);
+                self.add_common_schema(binding, &file);
             }
             return;
         }
-        let properties = extract_properties(binding);
+        let properties = {
+            let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
+            for (view, _) in
+                flat_views(binding, &file, &mut self.ref_cache, &self.roots)
+            {
+                for (name, hint) in extract_properties(&view) {
+                    merge_hint(merged.entry(name.clone()).or_default(), &hint);
+                }
+            }
+            merged
+        };
         let children = extract_children(
             binding,
             &file,
             &self.roots,
             &mut self.ref_cache,
-            &mut Vec::new(),
             0,
         );
         self.schemas.push(CompletionSchema {
@@ -197,9 +206,11 @@ impl Bindings {
 
     /// Hints from common-part schemas merge by property name; their value
     /// candidates dedupe across files. See `common`.
-    fn add_common_schema(&mut self, binding: &Value) {
-        for (name, hint) in extract_properties(binding) {
-            merge_hint(self.common.entry(name).or_default(), &hint);
+    fn add_common_schema(&mut self, binding: &Value, file: &Path) {
+        for (view, _) in flat_views(binding, file, &mut self.ref_cache, &self.roots) {
+            for (name, hint) in extract_properties(&view) {
+                merge_hint(self.common.entry(name.clone()).or_default(), &hint);
+            }
         }
     }
 
@@ -318,10 +329,14 @@ fn extract_properties(binding: &Value) -> BTreeMap<String, PropertyHint> {
     if let Some(Value::Mapping(props)) = binding.get("properties") {
         for (name, sub) in props.iter() {
             if let Some(name) = name.as_str() {
-                properties.insert(
-                    name.to_string(),
-                    property_hint(sub, required.contains(name)),
-                );
+                // dt-schema meta-constraints ($nodename, additional mapping
+                // hints) are directives, not devicetree properties
+                if !name.starts_with('$') {
+                    properties.insert(
+                        name.to_string(),
+                        property_hint(sub, required.contains(name)),
+                    );
+                }
             }
         }
     }
@@ -463,20 +478,58 @@ pub fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
     }
 }
 
+/// The terminal views of a schema: dtschema applies `allOf` members
+/// jointly and treats bare `$ref` wrappers transparently — chase both and
+/// OVERLAY: every reached view's inline content (its own `properties`,
+/// `patternProperties`, `required`, entries) describes the schema (the
+/// leds-gpio pattern child $refs leds/common.yaml while adding inline
+/// `gpios`; audio-graph-port's `definitions/endpoint-base` $refs the
+/// graph alongside its own dai properties). Chased targets dedupe per
+/// (file, fragment); deeper structural recursion stays depth-capped by
+/// `MAX_DEPTH`.
+fn flat_views(
+    sub: &Value,
+    origin_file: &Path,
+    ref_cache: &mut HashMap<PathBuf, Value>,
+    roots: &[PathBuf],
+) -> Vec<(Value, PathBuf)> {
+    let mut heads: Vec<(Value, PathBuf)> = Vec::new();
+    let mut seen: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    let mut queue: Vec<(Value, PathBuf)> = vec![(sub.clone(), origin_file.to_path_buf())];
+    while let Some((view, vorigin)) = queue.pop() {
+        if let Some(reference) = view.get("$ref").and_then(Value::as_str) {
+            if let Some((target, segments)) = split_ref(&vorigin, reference, roots) {
+                let key = (target.clone(), segments.clone());
+                if !seen.contains(&key) {
+                    if let Some(next) = load_ref_value(target.clone(), &segments, ref_cache) {
+                        seen.push(key);
+                        queue.push((next.clone(), target));
+                    }
+                }
+            }
+        }
+        if let Some(Value::Sequence(members)) = view.get("allOf") {
+            for member in members {
+                // members originate from the same file as their parent:
+                // their `#/…` fragments resolve there
+                queue.push((member.clone(), vorigin.clone()));
+            }
+        }
+        heads.push((view, vorigin));
+    }
+    heads
+}
+
 /// Extract the child-node schemas of `schema`: `patternProperties` entries
 /// (pattern children) and `properties` entries that structurally denote
-/// child nodes (fixed-name children). The view merges inline content with
-/// a `$ref`-resolved counterpart — dtschema merges both (leds-gpio children
-/// $ref leds/common.yaml while adding `gpios`; tegra210-sfc's `ports` $refs
-/// dt-schema's graph.yaml while pinning port@0). Recursion is depth-capped;
-/// ref cycles cut off via the visited stack of (file, fragment) resolution
-/// targets — same-file `$defs` chains are distinct targets, not cycles.
+/// child nodes (fixed-name children), collected from every flat view of
+/// `schema` (inline + `allOf` members + `$ref` wrappers). Recursion is
+/// depth-capped; ref chasing is cycle-guarded by `flat_views`.
 fn extract_children(
     schema: &Value,
     schema_file: &Path,
     roots: &[PathBuf],
     ref_cache: &mut HashMap<PathBuf, Value>,
-    visited: &mut Vec<(PathBuf, Vec<String>)>,
     depth: usize,
 ) -> Vec<ChildSchema> {
     const MAX_DEPTH: usize = 4;
@@ -484,32 +537,10 @@ fn extract_children(
         return Vec::new();
     }
     // collect catalog entries (patterns, subschema clone, origin file) from
-    // both views; clones avoid holding ref-cache borrows across recursion
+    // every flat view; clones avoid holding ref-cache borrows across recursion
     let mut entries: Vec<(Vec<String>, Value, PathBuf)> = Vec::new();
-    collect_child_entries(schema, schema_file, ref_cache, roots, visited, &mut entries);
-    let mut pushed_ref = false;
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        if let Some((target, segments)) = split_ref(schema_file, reference, roots) {
-            let expansion = (target.clone(), segments.clone());
-            if !visited.contains(&expansion) {
-                if let Some(view) = load_ref_value(target.clone(), &segments, ref_cache) {
-                    let view = view.clone();
-                    visited.push(expansion);
-                    pushed_ref = true;
-                    // the view's entries belong to the TARGET file: their
-                    // own fragment (#/…) and relative refs resolve there,
-                    // not in the schema doing the $ref'ing
-                    collect_child_entries(
-                        &view,
-                        &target,
-                        ref_cache,
-                        roots,
-                        visited,
-                        &mut entries,
-                    );
-                }
-            }
-        }
+    for (view, origin) in flat_views(schema, schema_file, ref_cache, roots) {
+        collect_child_entries(&view, &origin, ref_cache, roots, &mut entries);
     }
     // build per entry, merging same-pattern (duplicated inline+ref) entries
     let mut children: Vec<ChildSchema> = Vec::new();
@@ -520,7 +551,6 @@ fn extract_children(
             &origin_file,
             roots,
             ref_cache,
-            visited,
             depth,
         );
         if let Some(existing) = children
@@ -535,37 +565,35 @@ fn extract_children(
             children.push(built);
         }
     }
-    if pushed_ref {
-        visited.pop();
-    }
     children
 }
 
-/// One entry's full ChildSchema: leaf properties merge the entry's inline and
-/// `$ref`-resolved views; its own children recurse from the merged view.
+/// One entry's full ChildSchema: leaf properties merge from every flat
+/// view of the entry; its own children recurse likewise. `required:`
+/// entries of bare stubs (graph.yaml's `^port@…$` requires `reg` without a
+/// property body) synthesize required hints for names the views never
+/// spell out.
 fn child_schema_for(
     patterns: Vec<String>,
     subschema: &Value,
     origin_file: &Path,
     roots: &[PathBuf],
     ref_cache: &mut HashMap<PathBuf, Value>,
-    visited: &mut Vec<(PathBuf, Vec<String>)>,
     depth: usize,
 ) -> ChildSchema {
+    let heads = flat_views(subschema, origin_file, ref_cache, roots);
     let mut properties: BTreeMap<String, PropertyHint> = BTreeMap::new();
-    if let Some(reference) = subschema.get("$ref").and_then(Value::as_str) {
-        if let Some((target, segments)) = split_ref(origin_file, reference, roots) {
-            if let Some(view) = load_ref_value(target, &segments, ref_cache) {
-                for (name, hint) in extract_properties(view) {
-                    merge_hint(properties.entry(name).or_default(), &hint);
-                }
-            }
+    for (view, _) in &heads {
+        for (name, hint) in extract_properties(view) {
+            merge_hint(properties.entry(name.clone()).or_default(), &hint);
         }
     }
-    for (name, hint) in extract_properties(subschema) {
-        merge_hint(properties.entry(name).or_default(), &hint);
+    for (view, _) in &heads {
+        for name in required_set(view) {
+            properties.entry(name).or_default().required = true;
+        }
     }
-    let children = extract_children(subschema, origin_file, roots, ref_cache, visited, depth + 1);
+    let children = extract_children(subschema, origin_file, roots, ref_cache, depth + 1);
     ChildSchema {
         patterns,
         properties,
@@ -580,7 +608,6 @@ fn collect_child_entries(
     origin_file: &Path,
     ref_cache: &mut HashMap<PathBuf, Value>,
     roots: &[PathBuf],
-    visited: &mut Vec<(PathBuf, Vec<String>)>,
     entries: &mut Vec<(Vec<String>, Value, PathBuf)>,
 ) {
     if let Some(Value::Mapping(patterns)) = view.get("patternProperties") {
@@ -600,7 +627,7 @@ fn collect_child_entries(
             let (Some(name), Value::Mapping(_)) = (name.as_str(), sub) else {
                 continue;
             };
-            if node_like_or_resolved(sub, origin_file, ref_cache, roots, visited) {
+            if node_like_or_resolved(sub, origin_file, ref_cache, roots) {
                 entries.push((
                     vec![format!("^{name}$")],
                     sub.clone(),
@@ -613,9 +640,9 @@ fn collect_child_entries(
 
 /// devicetree nodes double as properties — dt-schema keeps no node/leaf
 /// distinction, so completion invents one: a mapping entry is node-like
-/// when its own body carries non-empty nested `properties`/
-/// `patternProperties`, or when its `$ref`-resolved counterpart does
-/// (e.g. bare `port@0: $ref: audio-graph-port.yaml#` entries).
+/// when it (or any of its flat views — inline, `allOf`, `$ref` chases)
+/// carries non-empty nested `properties`/`patternProperties` (e.g. bare
+/// `port@0: $ref: audio-graph-port.yaml#` entries).
 fn node_like(value: &Value) -> bool {
     for key in ["properties", "patternProperties"] {
         if let Some(Value::Mapping(inner)) = value.get(key) {
@@ -632,21 +659,13 @@ fn node_like_or_resolved(
     origin_file: &Path,
     ref_cache: &mut HashMap<PathBuf, Value>,
     roots: &[PathBuf],
-    visited: &[(PathBuf, Vec<String>)],
 ) -> bool {
     if node_like(sub) {
         return true;
     }
-    let Some(reference) = sub.get("$ref").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some((target, segments)) = split_ref(origin_file, reference, roots) else {
-        return false;
-    };
-    if visited.contains(&(target.clone(), segments.clone())) {
-        return false;
-    }
-    load_ref_value(target, &segments, ref_cache).is_some_and(node_like)
+    flat_views(sub, origin_file, ref_cache, roots)
+        .iter()
+        .any(|(view, _)| node_like(view))
 }
 
 /// Split a schema `$ref` into the target file path and the post-`#` key
@@ -1496,9 +1515,10 @@ patternProperties:
         )
         .unwrap();
 
-        // indexing the mutually-recursive pair terminates (visited-stack
-        // guard over ring entries + depth cap); the chain stays walkable
-        // and the guard flattens the cycle past the second ring
+        // indexing the mutually-recursive pair terminates: `flat_views`
+        // dedupes chased (file, fragment) targets per call and structural
+        // recursion is depth-capped, so rings echo a bounded number of
+        // levels and die at the MAX_DEPTH boundary
         let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
         let compat = &["vendor,cyc-a".to_string()];
         let hints = bindings.child_properties_for(compat, &["a-x".to_string()]);
@@ -1524,7 +1544,136 @@ patternProperties:
                     "b-w".to_string(),
                 ],
             )
+            .contains_key("a-marker"));
+        assert!(bindings
+            .child_properties_for(
+                compat,
+                &[
+                    "a-x".to_string(),
+                    "b-y".to_string(),
+                    "a-z".to_string(),
+                    "b-w".to_string(),
+                    "a-v".to_string(),
+                ],
+            )
+            .contains_key("b-marker"));
+        assert!(bindings
+            .child_properties_for(
+                compat,
+                &[
+                    "a-x".to_string(),
+                    "b-y".to_string(),
+                    "a-z".to_string(),
+                    "b-w".to_string(),
+                    "a-v".to_string(),
+                    "b-u".to_string(),
+                ],
+            )
             .is_empty());
+    }
+
+    #[test]
+    pub fn all_of_and_refs_flatten_to_terminal_views() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("panel-common.yaml"),
+            r#"
+$defs:
+  timing:
+    properties:
+      clock-frequency: true
+      hactive: true
+  timing-wrapper:
+    $ref: '#/$defs/timing'
+properties:
+  label: true
+  rotation: true
+  panel-timing:
+    $ref: '#/$defs/timing-wrapper'
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("panel.yaml"),
+            r#"
+allOf:
+  - $ref: panel-common.yaml#
+properties:
+  compatible:
+    const: vendor,panel
+  panel-timing: true
+"#,
+        )
+        .unwrap();
+
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let compat = &["vendor,panel".to_string()];
+
+        // allOf merge at the binding top: the common part's properties
+        // light up alongside the own ones
+        let top = bindings.properties_for(compat);
+        assert!(top.contains_key("label"));
+        assert!(top.contains_key("rotation"));
+        assert!(top["panel-timing"].boolean);
+
+        // the common part's panel-timing classifies as a child and its
+        // bare-wrapper chain ($ref -> $ref -> $defs/timing) chases to the
+        // timing properties
+        let timing = bindings.child_properties_for(compat, &["panel-timing".to_string()]);
+        assert!(timing.contains_key("clock-frequency"));
+        assert!(timing.contains_key("hactive"));
+    }
+
+    #[test]
+    pub fn nodename_meta_keys_stay_unsuggested() {
+        let mut bindings = Bindings::default();
+        let yaml: Value = serde_yaml::from_str(
+            r#"
+properties:
+  compatible:
+    const: vendor,named
+  $nodename:
+    pattern: "^thing@.*$"
+  reg: true
+"#,
+        )
+        .unwrap();
+        bindings.add_schema(PathBuf::from("named.yaml"), &yaml);
+        let hints = bindings.properties_for(&["vendor,named".to_string()]);
+        assert!(hints.contains_key("reg"));
+        assert!(!hints.contains_key("$nodename"));
+    }
+
+    #[test]
+    pub fn required_only_stubs_synthesize_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("stubbed.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,stub
+  ports:
+    type: object
+    patternProperties:
+      '^port@[0-9a-f]+$':
+        type: object
+        required:
+          - reg
+          - stub-clock
+"#,
+        )
+        .unwrap();
+
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let hints = bindings.child_properties_for(
+            &["vendor,stub".to_string()],
+            &["ports".to_string(), "port@0".to_string()],
+        );
+        // bodies of the pattern entry spell nothing out; the required
+        // list names members the final node must carry
+        assert!(hints["reg"].required);
+        assert!(hints["stub-clock"].required);
     }
 
     #[test]
@@ -1686,6 +1835,26 @@ properties:
         bindings.add_schema(PathBuf::from("serial.yaml"), &pattern_only);
         assert_eq!(bindings.schema_count(), 0);
         assert!(bindings.common_values("status").is_empty());
+    }
+
+    #[test]
+    #[ignore = "machine-local audit: times indexing the real kernel + pip roots"]
+    pub fn bindings_index_perf_canary() {
+        let start = std::time::Instant::now();
+        let bindings = Bindings::from_paths(&[
+            PathBuf::from(
+                "/home/matous/Development/HatiResearch/Unipi/kernelspace/unipi-kernel/linux/Documentation/devicetree/bindings",
+            ),
+            PathBuf::from(
+                "/home/matous/.local/share/pipx/venvs/dtschema/lib/python3.14/site-packages/dtschema/schemas",
+            ),
+        ]);
+        eprintln!(
+            "perf canary: indexed {} schemas, {} child schemas in {:?}",
+            bindings.schema_count(),
+            bindings.child_schema_count(),
+            start.elapsed()
+        );
     }
 
     #[test]
