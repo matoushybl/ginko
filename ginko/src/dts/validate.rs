@@ -1,5 +1,5 @@
 use crate::dts::ast::PropertyValue;
-use crate::dts::bindings::{node_compatibles, Bindings};
+use crate::dts::bindings::{node_compatibles, shape_satisfied, Bindings};
 use crate::dts::diagnostics::Diagnostic;
 use crate::dts::error_codes::ErrorCode;
 use crate::dts::resolved::{ResolvedNode, ResolvedTree};
@@ -68,14 +68,44 @@ fn check_node(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut V
     // required entries are judged PER BINDING so the message names the
     // binding that imposes — the preamble proves which binding's
     // requires list a property lives on
-    for (binding, properties) in &views {
-        for (name, hint) in properties.iter() {
+    for (binding, schema) in &views {
+        let mut fired: Vec<String> = Vec::new();
+        for (name, hint) in schema.properties.iter() {
             // required entries are satisfied by a property OR a child node
             // bearing the name — the devicetree property/node duality
             if hint.required
                 && node.get_property(name).is_none()
                 && !node.child_exists(name)
             {
+                fired.push(name.clone());
+                out.push(Diagnostic::new(
+                    identity.name.span(),
+                    identity.end.source(),
+                    ErrorCode::CustomWarning,
+                    format!("binding `{binding}` requires property `{name}`"),
+                ));
+            }
+        }
+        // compatible-controlled supplements: the `allOf: [if:, then:]`
+        // idiom — when the node's compatibles satisfy the condition
+        // shape, the then-required names bind too (the same fsl,imx8mp-xcvr
+        // `resets` idiom carries ~240 kernel bindings)
+        for conditional in &schema.conditionals {
+            if !conditional
+                .shapes
+                .iter()
+                .any(|shape| shape_satisfied(shape, &compatibles))
+            {
+                continue;
+            }
+            for name in &conditional.required {
+                if fired.contains(name)
+                    || node.get_property(name).is_some()
+                    || node.child_exists(name)
+                {
+                    continue;
+                }
+                fired.push(name.clone());
                 out.push(Diagnostic::new(
                     identity.name.span(),
                     identity.end.source(),
@@ -522,9 +552,136 @@ required:
         // attribution names the binding FILE (`st,stm32-exti.yaml`), not
         // the matched node string
         assert_eq!(views, vec!["st,stm32-exti".to_string()]);
-        // the pure-enum branch (no const anywhere) never anchors: a
-        // bare ["st,stm32-exti"] node stays suggestion-only
+        // ENUM-ANCHORED since the acceptance round: the pure-enum branch
+        // (no const anywhere) governs too — its whole anchoring is the
+        // linked values (the deprecated gcc spelling and the bare
+        // ['st,stm32-exti'] list alike)
         let enum_only = vec!["st,stm32-exti".to_string()];
-        assert!(bindings.normative_views(&enum_only).is_empty());
+        let views: Vec<String> = bindings
+            .normative_views(&enum_only)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(views, vec!["st,stm32-exti".to_string()]);
+        let deprecated_gcc = vec!["qcom,gcc-apq8064".to_string()];
+        let views: Vec<String> = bindings
+            .normative_views(&deprecated_gcc)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(views, vec!["qcom,gcc-apq8064".to_string()]);
+    }
+
+    #[test]
+    pub fn enum_anchored_bindings_impose_requirements() {
+        // the fsl,imx8-pcie-phy shape: `compatible: enum:` with an
+        // unconditional required list — enum anchoring was the round-2
+        // head precisely because the user's imx8mm pcie-phy node cites
+        // ONLY the enum value (no const fallback) and the binding's
+        // fsl,refclk-pad-mode went unseen
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,phy.yaml"),
+            r#"
+properties:
+  compatible:
+    enum:
+      - "vendor,phy-a"
+      - "vendor,phy-b"
+  refclk-mode:
+    description: pad reference clock mode
+required:
+  - compatible
+  - refclk-mode
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let (project, _temp, paths) = open_project(&[(
+            "test.dts",
+            "/dts-v1/;\n\n/ {\n\tphy@1 {\n\t\tcompatible = \"vendor,phy-b\";\n\t};\n};\n",
+        )]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(diags.len(), 1, "{:#?}", diags);
+        assert!(diags[0].message.contains("binding `vendor,phy` requires property `refclk-mode`"));
+        let (project, _temp, paths) = open_project(&[(
+            "test.dts",
+            "/dts-v1/;\n\n/ {\n\tphy@1 {\n\t\tcompatible = \"vendor,phy-a\";\n\t\trefclk-mode = <1>;\n\t};\n};\n",
+        )]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert!(diags.is_empty(), "{diags:#?}");
+        let (project, _temp, paths) = open_project(&[(
+            "test.dts",
+            "/dts-v1/;\n\n/ {\n\tphy@1 {\n\t\tcompatible = \"vendor,unrelated\", \"syscon\";\n\t};\n};\n",
+        )]);
+        assert!(diags_for(&project, &paths[0], &bindings).is_empty());
+    }
+
+    #[test]
+    pub fn if_then_conditionals_bind_required_per_compatible() {
+        // the `allOf: [if:, then:]` idiom: a node whose compatibles
+        // satisfy the if-compatible condition carries the then-required
+        // names IN ADDITION to the unconditional list; unconditioned
+        // variants stay clean (contains-const AND contains-enum
+        // condition spellings both parse)
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,dev-family.yaml"),
+            r#"
+properties:
+  compatible:
+    enum:
+      - "vendor,dev"
+      - "vendor,dev2"
+      - "vendor,dev3"
+  plain-prop:
+    description: always needed
+  turbo-prop:
+    description: only the -dev2 variant
+  extra-prop:
+    description: only the -dev3 variant
+required:
+  - compatible
+  - plain-prop
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: vendor,dev2
+    then:
+      required:
+        - turbo-prop
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "vendor,dev3"
+    then:
+      required:
+        - extra-prop
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let (project, _temp, paths) = open_project(&[(
+            "test.dts",
+            "/dts-v1/;\n\n/ {\n\tdev1: dev@1 {\n\t\tcompatible = \"vendor,dev\";\n\t\tplain-prop = <1>;\n\t};\n\tdev2: dev@2 {\n\t\tcompatible = \"vendor,dev2\";\n\t\tplain-prop = <2>;\n\t};\n\tdev3: dev@3 {\n\t\tcompatible = \"vendor,dev3\";\n\t\tplain-prop = <3>;\n\t\textra-prop = <3>;\n\t};\n};\n",
+        )]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        // dev1 clean (no condition matches); dev2 missing only
+        // turbo-prop; dev3 complete with extra-prop
+        assert_eq!(diags.len(), 1, "{:#?}", diags);
+        assert!(diags[0]
+            .message
+            .contains("binding `vendor,dev-family` requires property `turbo-prop`"));
+        // with the conditional property supplied, the whole tree is
+        // silent — the unconditional list never fires
+        let (project, _temp, paths) = open_project(&[(
+            "test.dts",
+            "/dts-v1/;\n\n/ {\n\tdev2: dev@2 {\n\t\tcompatible = \"vendor,dev2\";\n\t\tplain-prop = <2>;\n\t\tturbo-prop = <2>;\n\t};\n};\n",
+        )]);
+        assert!(diags_for(&project, &paths[0], &bindings).is_empty());
     }
 }

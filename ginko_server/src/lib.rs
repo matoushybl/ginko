@@ -104,11 +104,12 @@ impl Backend {
         let paths: Vec<PathBuf> = binding_paths.iter().map(PathBuf::from).collect();
         self.bindings = Bindings::from_paths(&paths);
         tracing::info!(
-            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas",
+            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas, {} conditionals",
             self.bindings.schema_count(),
             self.bindings.compatible_count(),
             self.bindings.common_prop_count(),
-            self.bindings.child_schema_count()
+            self.bindings.child_schema_count(),
+            self.bindings.conditional_count()
         );
         self
     }
@@ -245,9 +246,17 @@ impl Backend {
                 .get_diagnostics(&file)
                 .map(|diag| self.lsp_diag_from_diag(diag))
                 .collect_vec();
-            // binding-driven validation (conservative dtbs_check baseline);
-            // no-ops entirely when no bindings root is configured
-            if !self.bindings.is_empty() {
+            // binding-driven checks are gated on OPEN files: the resolved-tree
+            // walk is the expensive step of a publish, no-open-buffer files
+            // (include-closure members, auto-loaded includes) cannot render
+            // anything an editor would show, and their default-URI publishes
+            // keep carrying the cheap dts diagnostics. Keyed canonical per
+            // didOpen; project paths matching either spelling count as open.
+            let opened = open_uris.contains_key(&file)
+                || fs::canonicalize(&file)
+                    .map(|canonical| open_uris.contains_key(&canonical))
+                    .unwrap_or(false);
+            if opened && !self.bindings.is_empty() {
                 let binding_diags = self
                     .project
                     .read()

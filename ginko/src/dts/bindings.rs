@@ -28,15 +28,41 @@ use crate::dts::resolved::ResolvedNode;
 /// binding when it satisfies one alternative: EVERY `const:` entry
 /// present, plus at least one `linked` enum value when the
 /// alternative has any (the `[enum-vendors, "syscon"]` positional
-/// shape). Alternatives without a const can never anchor a node —
-/// enum-only shapes stay suggestion-only.
+/// shape — or a pure enum/contains constraint, whose whole anchoring
+/// IS the linked values).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompatibleShape {
     /// Every `const:` entry — a matching node must carry ALL of them.
     pub consts: Vec<String>,
-    /// Positionally-linked `enum:` values of an `items:` sequence
-    /// that also pins a const — a matching node must carry one.
+    /// `enum:` values — a matching node must carry one when the list
+    /// is non-empty (positional items enums and free enums alike).
     pub linked: Vec<String>,
+}
+
+/// Whether a node's compatible list satisfies ONE alternative/shape:
+/// every const present, plus one linked enum where the shape pins
+/// any. Shared by `schema_accepts` and the if-then condition match —
+/// the SAME machine judges binding selection and conditionals.
+pub fn shape_satisfied(shape: &CompatibleShape, compatibles: &[String]) -> bool {
+    (!shape.consts.is_empty() || !shape.linked.is_empty())
+        && shape.consts.iter().all(|crit| compatibles.contains(crit))
+        && (shape.linked.is_empty()
+            || shape.linked.iter().any(|link| compatibles.contains(link)))
+}
+
+/// A compatible-controlled conditional requirement — the `allOf:
+/// [{if:, then:}]` idiom: when a node's compatible list satisfies ANY
+/// of the `if`-compatible `shapes`, every `required` name binds in
+/// ADDITION to the binding's unconditional list (the
+/// fsl,imx8mp-xcvr `resets` idiom; some 240 kernel bindings carry
+/// one).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Conditional {
+    /// The `if.properties.compatible` sub-schema parsed through the
+    /// alternatives machine — a node matching any shape triggers.
+    pub shapes: Vec<CompatibleShape>,
+    /// Every `then.required` name the condition imposes.
+    pub required: Vec<String>,
 }
 
 /// A binding file distilled to completion data.
@@ -53,6 +79,10 @@ pub struct CompletionSchema {
     /// branch; the parse tree of an unbranched constraint collapses
     /// to a single alternative.
     pub alternatives: Vec<CompatibleShape>,
+    /// Compatible-controlled requirement supplements (`if/then`
+    /// members carrying a then-required list) — applied by the
+    /// validator when the node's compatibles match the condition.
+    pub conditionals: Vec<Conditional>,
     /// All `enum:` values — index suggestion keys only; never a
     /// constraint (completion keeps the v1 over-collection).
     pub enums: Vec<String>,
@@ -150,6 +180,13 @@ impl Bindings {
         self.schemas.len()
     }
 
+    /// Every parsed compatible-controlled conditional (`if/then`
+    /// members with a then-required list) — audit metric for the
+    /// conditional-round parse (~240 kernel bindings carry one).
+    pub fn conditional_count(&self) -> usize {
+        self.schemas.iter().map(|s| s.conditionals.len()).sum()
+    }
+
     /// Whether any binding data was indexed — completion hints and
     /// binding-driven validators no-op when false.
     pub fn is_empty(&self) -> bool {
@@ -186,32 +223,29 @@ impl Bindings {
 
     /// Whether a node's compatible list satisfies schema `idx`'s
     /// compatible constraint — the DISJUNCTIVE model: the node must
-    /// satisfy ONE alternative (every const of the alternative plus,
-    /// where it pins any, one linked enum). Alternatives without a
-    /// const anchor (pattern/contains/enum-only shapes — exactly the
-    /// syscon-impostor leak family: `qcom,gcc-apq8064.yaml`'s bare
-    /// `- const: syscon` branch once pooled into a global consts list
-    /// and judged every syscon node) never impose requirements —
-    /// their match semantics exceed this round's approximation;
-    /// `properties_for` still over-collects their hints for completion.
+    /// satisfy ONE alternative (`shape_satisfied`) — all consts plus,
+    /// where pinned, one linked enum. Const-ANCHORED alternatives
+    /// govern exactly; enum/contains-anchored alternatives (the
+    /// fsl,imx8-pcie-phy family — `compatible: enum:`) impose too:
+    /// their whole anchoring is the linked values. Pattern-only
+    /// shapes (regex) still impose nothing — matching them exceeds
+    /// this round's approximation; `properties_for` still
+    /// over-collects every schema's hints for completion.
     pub fn schema_accepts(&self, idx: usize, compatibles: &[String]) -> bool {
-        self.schemas[idx].alternatives.iter().any(|alt| {
-            !alt.consts.is_empty()
-                && alt.consts.iter().all(|crit| compatibles.contains(crit))
-                && (alt.linked.is_empty()
-                    || alt.linked.iter().any(|link| compatibles.contains(link)))
-        })
+        self.schemas[idx]
+            .alternatives
+            .iter()
+            .any(|alt| shape_satisfied(alt, compatibles))
     }
 
     /// The NORMATIVE schemas matching a node's compatible list — one
     /// entry per ACCEPTED binding, carrying the binding's identifier
-    /// (its file stem) for diagnostic attribution and its merged
-    /// property hints. A node's requirements are judged per binding:
-    /// required-missing messages name the imposing binding.
+    /// (its file stem) for diagnostic attribution and the schema
+    /// itself (unconditional properties + conditionals) ..
     pub fn normative_views(
         &self,
         compatibles: &[String],
-    ) -> Vec<(String, &BTreeMap<String, PropertyHint>)> {
+    ) -> Vec<(String, &CompletionSchema)> {
         let mut out = Vec::new();
         let mut seen: Vec<usize> = Vec::new();
         for compatible in compatibles {
@@ -226,7 +260,7 @@ impl Bindings {
                     .and_then(|stem| stem.to_str())
                     .unwrap_or("unknown binding")
                     .to_string();
-                out.push((name, &self.schemas[idx].properties));
+                out.push((name, &self.schemas[idx]));
             }
         }
         out
@@ -286,6 +320,7 @@ impl Bindings {
             }
             return;
         }
+        let mut conditionals = Vec::new();
         let properties = {
             let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
             for (view, _) in
@@ -294,6 +329,7 @@ impl Bindings {
                 for (name, hint) in extract_properties(&view) {
                     merge_hint(merged.entry(name.clone()).or_default(), &hint);
                 }
+                collect_conditionals(&view, &mut conditionals);
             }
             merged
         };
@@ -309,6 +345,7 @@ impl Bindings {
             properties,
             children,
             alternatives,
+            conditionals,
             enums: keys,
         });
         let idx = self.schemas.len() - 1;
@@ -487,15 +524,15 @@ fn extract_properties(binding: &Value) -> BTreeMap<String, PropertyHint> {
 /// `CompatibleShape` alternatives plus free `enum:` suggestion keys:
 /// - a `oneOf`/`anyOf` contributes one alternative per branch — a
 ///   node matching ANY branch matches the schema, so branch consts
-///   must never pool (a bare `- const: syscon` branch is one match
-///   path, not a global requirement);
+///   must never pool (a branch is one match path, not a global
+///   requirement);
 /// - an `items:` position sequence pins its `const:` positions and
-///   positionally LINKS its enum positions when at least one const is
-///   pinned (the `[enum-vendors, "syscon"]` shape) — const-less
-///   sequences stay suggestion-only;
-/// - `contains:` and free `enum:` hints contribute suggestion keys
-///   but never constraints (an expansion-bus binding must not impose
-///   on every syscon node).
+///   positionally links its `enum:` positions — const-less sequences
+///   anchor purely through the linked enums;
+/// - free `enum:` and `contains:` constraints anchor the same way:
+///   one linked value present (the fsl,imx8-pcie-phy /
+///   `compatible: enum:` family; `contains: const: X` reduces to
+///   consts=[X]).
 ///
 /// A nested disjunction under `allOf` merges conjunctively — a
 /// conservative approximation not seen in real bindings.
@@ -523,10 +560,14 @@ fn collect_compatible_shapes(
                         }
                     }
                     Some("enum") => {
+                        // a free enum anchors the alternative: one of
+                        // the values must be present (enum-anchored
+                        // bindings impose since this round)
                         if let Value::Sequence(items) = val {
                             for item in items {
                                 if let Some(string) = item.as_str() {
                                     keys.push(string.to_string());
+                                    accum.linked.push(string.to_string());
                                 }
                             }
                         }
@@ -540,7 +581,10 @@ fn collect_compatible_shapes(
                             }
                             accum.consts.extend(seq_consts.iter().cloned());
                             if seq_consts.is_empty() {
-                                keys.extend(seq_enums);
+                                // a const-less position sequence anchors
+                                // purely through its enums
+                                keys.extend(seq_enums.iter().cloned());
+                                accum.linked.extend(seq_enums);
                             } else {
                                 accum.linked.extend(seq_enums.iter().cloned());
                                 keys.extend(seq_enums);
@@ -575,9 +619,21 @@ fn collect_compatible_shapes(
                         }
                     }
                     Some("contains") => {
-                        // an "at least one member" hint: suggestion keys
-                        // only, never a constraint
-                        collect_compatible_shapes(val, keys);
+                        // an "at least one member" constraint — the
+                        // contained values anchor this frame (the
+                        // if-then condition idiom and binding-level
+                        // syscon selects both reduce here)
+                        for alt in collect_compatible_shapes(val, keys) {
+                            if branches.is_empty() {
+                                accum.consts.extend(alt.consts);
+                                accum.linked.extend(alt.linked);
+                            } else {
+                                for frame in &mut branches {
+                                    frame.consts.extend(alt.consts.iter().cloned());
+                                    frame.linked.extend(alt.linked.iter().cloned());
+                                }
+                            }
+                        }
                     }
                     _ => {
                         // $ref descendants and other wrappers: recurse
@@ -597,13 +653,13 @@ fn collect_compatible_shapes(
                 }
             }
             if branches.is_empty() {
-                return if accum.consts.is_empty() {
+                return if accum.consts.is_empty() && accum.linked.is_empty() {
                     Vec::new()
                 } else {
                     vec![accum]
                 };
             }
-            if !accum.consts.is_empty() {
+            if !accum.consts.is_empty() || !accum.linked.is_empty() {
                 // a const pinned beside a disjunction conjoins with
                 // every branch — stricter (safe) direction
                 for frame in &mut branches {
@@ -642,6 +698,46 @@ fn collect_item_position(item: &Value, consts: &mut Vec<String>, enums: &mut Vec
             _ => {}
         }
     }
+}
+
+/// Extract a compatible-controlled conditional requirement from one
+/// `{if:, then:}` view of a binding (an `allOf` member flattened
+/// into a terminal view). The `if.properties.compatible` sub-schema —
+/// collected through the SAME alternatives machine that governs
+/// binding selection — is the condition; every `then.required` name
+/// binds for a node matching it. Conditionals on other properties and
+/// then-shapes without a required list stay out of scope (they
+/// refine values, not requirements).
+fn collect_conditionals(view: &Value, out: &mut Vec<Conditional>) {
+    let Some(Value::Mapping(if_block)) = view.get("if") else {
+        return;
+    };
+    let Some(then_block) = view.get("then") else {
+        return;
+    };
+    let Some(condition) = if_block
+        .get("properties")
+        .and_then(|props| props.get("compatible"))
+    else {
+        return;
+    };
+    let mut sink = Vec::new();
+    let shapes = collect_compatible_shapes(condition, &mut sink);
+    let Some(Value::Sequence(required)) = then_block.get("required") else {
+        return;
+    };
+    let names: Vec<String> = required
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if shapes.is_empty() || names.is_empty() {
+        return;
+    }
+    out.push(Conditional {
+        shapes,
+        required: names,
+    });
 }
 
 fn property_hint(sub: &Value, required: bool) -> PropertyHint {
