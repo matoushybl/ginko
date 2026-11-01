@@ -88,8 +88,9 @@ fn check_node(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut V
         }
         // compatible-controlled supplements: the `allOf: [if:, then:]`
         // idiom — when the node's compatibles satisfy the condition
-        // shape, the then-required names bind too (the same fsl,imx8mp-xcvr
-        // `resets` idiom carries ~240 kernel bindings)
+        // shape, the then-required names bind too (the fsl,imx8mp-xcvr
+        // `resets` idiom, ~240 kernel bindings); the then-VALUES flow
+        // through the pooled hint map instead (enum judgement)
         for conditional in &schema.conditionals {
             if !conditional
                 .shapes
@@ -98,8 +99,9 @@ fn check_node(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut V
             {
                 continue;
             }
-            for name in &conditional.required {
-                if fired.contains(name)
+            for (name, hint) in &conditional.properties {
+                if !hint.required
+                    || fired.contains(name)
                     || node.get_property(name).is_some()
                     || node.child_exists(name)
                 {
@@ -683,5 +685,106 @@ allOf:
             "/dts-v1/;\n\n/ {\n\tdev2: dev@2 {\n\t\tcompatible = \"vendor,dev2\";\n\t\tplain-prop = <2>;\n\t\tturbo-prop = <2>;\n\t};\n};\n",
         )]);
         assert!(diags_for(&project, &paths[0], &bindings).is_empty());
+    }
+
+    #[test]
+    pub fn conditionals_refine_value_pools_per_compatible() {
+        // the refinement round: then.properties values overlay a
+        // matching node's pools with UNION semantics — conditional-only
+        // pools (rpmcc clock-names: base carries no enum) fill for the
+        // matching variant and stay empty for every other node, and
+        // required-only + properties-value idiom live in ONE overlay.
+        // minItems/maxItems-only then-shapes enrich nothing and drop.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,dev-family.yaml"),
+            r#"
+properties:
+  compatible:
+    enum:
+      - "vendor,dev"
+      - "vendor,dev2"
+  mode-prop:
+    description: variant dependent, unconstrained by the base
+  bulk-prop:
+    description: only ever listwise-shaped
+required:
+  - compatible
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: vendor,dev2
+    then:
+      required:
+        - turbo-prop
+      properties:
+        mode-prop:
+          enum: [ turbo, hyperspeed ]
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: vendor,dev2
+    then:
+      properties:
+        power-names:
+          items:
+            - const: bus
+            - const: core
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - "vendor,dev"
+    then:
+      properties:
+        bulk-prop:
+          minItems: 1
+          maxItems: 4
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let dev2 = vec!["vendor,dev2".to_string()];
+        let dev1 = vec!["vendor,dev".to_string()];
+        // completion narrows per variant: dev2 sees the conditional
+        // values, dev1 sees none of them (shape not satisfied)
+        let pool2 = bindings.properties_for(&dev2);
+        let pool1 = bindings.properties_for(&dev1);
+        assert_eq!(
+            pool2.get("mode-prop").unwrap().values,
+            vec!["turbo".to_string(), "hyperspeed".to_string()]
+        );
+        assert!(pool2.get("power-names").unwrap().values.contains(&"bus".to_string()));
+        assert!(pool2.get("turbo-prop").unwrap().required);
+        assert!(!pool1.contains_key("power-names"));
+        assert!(pool1.get("mode-prop").unwrap().values.is_empty());
+        assert!(!pool1.contains_key("turbo-prop"));
+        // minItems-only conditional dropped everywhere
+        assert!(pool1.get("bulk-prop").unwrap().values.is_empty());
+        assert!(pool2.get("bulk-prop").unwrap().values.is_empty());
+        // the normative pool mirrors the overlay: enum-anchored binding
+        // accepts, conditional-only candidates reach the judge
+        let norm2 = bindings.normative_properties_for(&dev2);
+        assert_eq!(
+            norm2.get("mode-prop").unwrap().values,
+            vec!["turbo".to_string(), "hyperspeed".to_string()]
+        );
+        // a dev2 node with a wrong mode-prop is judged against the
+        // conditional pool; a dev1 node's same string stays silent
+        // (no candidates anywhere) — union never produces constraints
+        // where the binding lists none
+        let (project, _temp, paths) = open_project(&[(
+            "test.dts",
+            "/dts-v1/;\n\n/ {\n\tdev2: dev@2 {\n\t\tcompatible = \"vendor,dev2\";\n\t\tmode-prop = \"wrong\";\n\t\tturbo-prop = <1>;\n\t};\n\tdev1: dev@1 {\n\t\tcompatible = \"vendor,dev\";\n\t\tmode-prop = \"wrong\";\n\t};\n};\n",
+        )]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(diags.len(), 1, "{:#?}", diags);
+        assert!(diags[0]
+            .message
+            .contains("unknown value `wrong` for property `mode-prop` — expected one of: turbo, hyperspeed"));
     }
 }

@@ -61,8 +61,14 @@ pub struct Conditional {
     /// The `if.properties.compatible` sub-schema parsed through the
     /// alternatives machine — a node matching any shape triggers.
     pub shapes: Vec<CompatibleShape>,
-    /// Every `then.required` name the condition imposes.
-    pub required: Vec<String>,
+    /// The `then` sub-schema's comprises distilled: value candidates
+    /// (the rpmcc per-SoC `clock-names` / blk-ctrl
+    /// `power-domain-names` refinement) AND `then.required` flags —
+    /// one hint map for both purposes. Overlaid on a matching node's
+    /// pools with union semantics (merge_hint), so the refinement
+    /// is additive and silence-gate safe. Property-only conditionals
+    /// (no then.required) count — they refine values, not just bind.
+    pub properties: BTreeMap<String, PropertyHint>,
 }
 
 /// A binding file distilled to completion data.
@@ -203,6 +209,10 @@ impl Bindings {
     /// by any-shared-string (a `syscon` sibling binding suggests its
     /// properties); requirements must come from bindings that genuinely
     /// accept the node.
+    /// Props from ACCEPTED schemas and their SHAPE-MATCHED conditionals
+    /// merged into one pool — a node carrying the if-compatible sees the
+    /// then-values as judgement candidates (rpmcc's conditional-ONLY
+    /// clock-names pools fill; overlays are UNION, never narrowing).
     pub fn normative_properties_for(
         &self,
         compatibles: &[String],
@@ -215,6 +225,18 @@ impl Bindings {
                 }
                 for (name, hint) in &self.schemas[*idx].properties {
                     merge_hint(merged.entry(name.clone()).or_default(), hint);
+                }
+                for conditional in &self.schemas[*idx].conditionals {
+                    if !conditional
+                        .shapes
+                        .iter()
+                        .any(|shape| shape_satisfied(shape, compatibles))
+                    {
+                        continue;
+                    }
+                    for (name, hint) in &conditional.properties {
+                        merge_hint(merged.entry(name.clone()).or_default(), hint);
+                    }
                 }
             }
         }
@@ -268,13 +290,28 @@ impl Bindings {
 
     /// Merge the property hints of all schemas matching any of the given
     /// compatible strings. A property required by any schema stays required;
-    /// the first non-empty hint wins for the optional fields.
+    /// the first non-empty hint wins for the optional fields. CONDITIONAL
+    /// overlays apply per shape match: a node carrying the if-compatible
+    /// gains the then-properties' values and requirements (completion
+    /// narrows per-SoC without any acceptance gate).
     pub fn properties_for(&self, compatibles: &[String]) -> BTreeMap<String, PropertyHint> {
         let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
         for compatible in compatibles {
             for idx in self.by_compatible.get(compatible).into_iter().flatten() {
                 for (name, hint) in &self.schemas[*idx].properties {
                     merge_hint(merged.entry(name.clone()).or_default(), hint);
+                }
+                for conditional in &self.schemas[*idx].conditionals {
+                    if !conditional
+                        .shapes
+                        .iter()
+                        .any(|shape| shape_satisfied(shape, compatibles))
+                    {
+                        continue;
+                    }
+                    for (name, hint) in &conditional.properties {
+                        merge_hint(merged.entry(name.clone()).or_default(), hint);
+                    }
                 }
             }
         }
@@ -700,14 +737,16 @@ fn collect_item_position(item: &Value, consts: &mut Vec<String>, enums: &mut Vec
     }
 }
 
-/// Extract a compatible-controlled conditional requirement from one
-/// `{if:, then:}` view of a binding (an `allOf` member flattened
-/// into a terminal view). The `if.properties.compatible` sub-schema —
-/// collected through the SAME alternatives machine that governs
-/// binding selection — is the condition; every `then.required` name
-/// binds for a node matching it. Conditionals on other properties and
-/// then-shapes without a required list stay out of scope (they
-/// refine values, not requirements).
+/// Extract a compatible-controlled conditional from one `{if:, then:}`
+/// view of a binding (an `allOf` member flattened into a terminal
+/// view). The `if.properties.compatible` sub-schema — collected
+/// through the SAME alternatives machine that governs binding
+/// selection — is the condition; the `then` sub-schema's properties
+/// and required list distill to one hint overlay: value candidates
+/// (rpmcc per-SoC clock-names) AND supplemental requirements in a
+/// single map. Conditionals on other properties stay out of scope,
+/// and then-shapes that neither bind requirements nor contribute
+/// candidates (minItems/maxItems-only) are dropped.
 fn collect_conditionals(view: &Value, out: &mut Vec<Conditional>) {
     let Some(Value::Mapping(if_block)) = view.get("if") else {
         return;
@@ -723,20 +762,23 @@ fn collect_conditionals(view: &Value, out: &mut Vec<Conditional>) {
     };
     let mut sink = Vec::new();
     let shapes = collect_compatible_shapes(condition, &mut sink);
-    let Some(Value::Sequence(required)) = then_block.get("required") else {
-        return;
-    };
-    let names: Vec<String> = required
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    if shapes.is_empty() || names.is_empty() {
+    let mut overlay = extract_properties(then_block);
+    // then.required names WITHOUT a property definition (the fsl,xcvr
+    // `resets` spelling) still synthesize bare required hints
+    if let Some(Value::Sequence(required)) = then_block.get("required") {
+        for name in required.iter().filter_map(Value::as_str) {
+            overlay.entry(name.to_string()).or_default().required = true;
+        }
+    }
+    let enriching = overlay
+        .values()
+        .any(|hint| hint.required || !hint.values.is_empty());
+    if shapes.is_empty() || !enriching {
         return;
     }
     out.push(Conditional {
         shapes,
-        required: names,
+        properties: overlay,
     });
 }
 
