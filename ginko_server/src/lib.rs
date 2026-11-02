@@ -604,6 +604,12 @@ impl LanguageServer for Backend {
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                     ..Default::default()
                 };
+                // the binding deprecated this idiom — editors strike the
+                // item through (the completion twin of the validator's
+                // deprecated-use Hint)
+                if hint.deprecated {
+                    item.deprecated = Some(true);
+                }
                 if let Some(description) = hint.description {
                     item.documentation = Some(Documentation::MarkupContent(MarkupContent {
                         kind: MarkupKind::Markdown,

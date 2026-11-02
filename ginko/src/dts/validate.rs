@@ -30,8 +30,10 @@ use std::path::Path;
 /// - dependent-required: a present trigger property calls for its
 ///   dependent names (gpio-charger's gpios family) — Warning, no
 ///   trigger, no judgement.
-/// - deprecated-use: DEFERRED to a policy round — stock in-tree dtsi
-///   legitimately carries deprecated idioms.
+/// - deprecated-use: a governing binding marks the property's idiom
+///   superseded — Hint (quiet by default: historical stock-tree uses
+///   aren't user error), attributed to the deprecating binding,
+///   anchored at the property itself.
 pub fn binding_diagnostics(
     tree: &ResolvedTree,
     file: &Path,
@@ -225,15 +227,39 @@ fn check_node(
         }
         let hint = hints.get(&name);
         if let Some(hint) = hint {
-            // deprecated-use notices are deferred: in-tree dtsi files
-            // legitimately carry deprecated idioms — a policy decision,
-            // not this round
             if hint.boolean && !property.values.is_empty() {
                 out.push(Diagnostic::new(
                     property.name.span(),
                     source.clone(),
                     ErrorCode::CustomWarning,
                     format!("property `{name}` is boolean — write it bare, without a value"),
+                ));
+            }
+            // deprecated-use: a GOVERNING binding marked the property's
+            // idiom superseded (gpio-hog-style renames, legacy unit
+            // spellings); fires at the property's own span, attributed
+            // to the accepted binding that carries the flag — a flag
+            // riding a matched conditional overlay attributes to the
+            // first accepting binding
+            if hint.deprecated {
+                let deprecator = views
+                    .iter()
+                    .find_map(|(binding, schema)| {
+                        schema
+                            .properties
+                            .get(&name)
+                            .filter(|hint| hint.deprecated)
+                            .map(|_| binding.clone())
+                    });
+                let attributed = match &deprecator {
+                    Some(binding) => format!(" — binding `{binding}`"),
+                    None => " by its binding".to_string(),
+                };
+                out.push(Diagnostic::new(
+                    property.name.span(),
+                    source.clone(),
+                    ErrorCode::CustomHint,
+                    format!("property `{name}` is deprecated{attributed}"),
                 ));
             }
         }
@@ -378,9 +404,9 @@ properties:
         // good@1 clean (req-prop as property, sub as CHILD node,
         // allow-prop spelled `true` = allowed-unconstrained, not boolean);
         // unmatched@3 has no binding (silent); plain@4 compatible-less;
-        // old-prop stays silent — deprecated notices deferred to a policy
-        // round; bad@2 fires the checks
-        assert_eq!(diags.len(), 5, "{:#?}", diags);
+        // bad@2 fires the four warning checks plus the deprecated HINT
+        // on old-prop
+        assert_eq!(diags.len(), 6, "{:#?}", diags);
         let compat_line = text.lines().position(|l| l.contains("bad@2")).unwrap();
         let by_kind = |code: ErrorCode| {
             diags
@@ -412,8 +438,13 @@ properties:
             .collect_vec();
         assert_eq!(bare.len(), 1);
         let deprecated = by_kind(ErrorCode::CustomHint);
-        // deprecated-use is deferred — no Hint diagnostics at all
-        assert!(deprecated.is_empty());
+        // deprecated-use is a Hint: bad@2's old-prop fires exactly once,
+        // attributed, anchored at the property — good@1's clean node and
+        // the stock idiom tolerance live in the gate's allowlist instead
+        assert_eq!(deprecated.len(), 1, "{deprecated:#?}");
+        assert!(deprecated[0]
+            .message
+            .contains("property `old-prop` is deprecated — binding `vendor,dev`"));
     }
 
     #[test]
