@@ -37,6 +37,13 @@ pub struct CompatibleShape {
     /// `enum:` values — a matching node must carry one when the list
     /// is non-empty (positional items enums and free enums alike).
     pub linked: Vec<String>,
+    /// Set when the consts came EXCLUSIVELY from a positional pure-const
+    /// `items:` tuple: acceptance is then dt-schema TUPLE semantics, not
+    /// member-pool semantics — the node's list must equal the tuple's
+    /// prefix with a length of at least `min_prefix` (the psci.yaml
+    /// `items: [const arm,psci-1.0, const arm,psci-0.2, consts p…]`
+    /// with `minItems: 1`: a bare `[arm,psci-1.0]` IS a match).
+    pub min_prefix: Option<usize>,
 }
 
 /// Whether a node's compatible list satisfies ONE alternative/shape:
@@ -44,8 +51,19 @@ pub struct CompatibleShape {
 /// any. Shared by `schema_accepts` and the if-then condition match —
 /// the SAME machine judges binding selection and conditionals.
 pub fn shape_satisfied(shape: &CompatibleShape, compatibles: &[String]) -> bool {
-    (!shape.consts.is_empty() || !shape.linked.is_empty())
-        && shape.consts.iter().all(|crit| compatibles.contains(crit))
+    if shape.consts.is_empty() && shape.linked.is_empty() {
+        return false;
+    }
+    if let Some(min) = shape.min_prefix {
+        // positional pure-const items-tuple (dt-schema `items:` array
+        // semantics): the node's compatible list must be a prefix of the
+        // tuple — positionally equal slot for slot — with a length of at
+        // least the sibling `minItems:` (0 when unlisted). A longer list
+        // than the tuple is tolerated (unconstrained beyond the array)
+        return compatibles.len() >= min
+            && compatibles.iter().zip(shape.consts.iter()).all(|(c, t)| c == t);
+    }
+    shape.consts.iter().all(|crit| compatibles.contains(crit))
         && (shape.linked.is_empty()
             || shape.linked.iter().any(|link| compatibles.contains(link)))
 }
@@ -191,6 +209,14 @@ pub struct Bindings {
     /// The binding roots given to `from_paths` — the resolution base for
     /// dt-schema flavour absolute refs (`/schemas/graph.yaml#/…`).
     roots: Vec<PathBuf>,
+    /// EVERY compatible string the corpus documents ANYWHERE — top-level
+    /// binding alternatives AND child-schema positions alike (the
+    /// fsl,sec-v4.0 `jr` job rings, the snvs powerkey/rtc-lp children,
+    /// `arm,idle-state` state nodes: child-held strings the corpus
+    /// justifies even though no TOP-LEVEL binding accepts them). The
+    /// bondless HINT consults this alone: a string documented in child
+    /// position is corpus-governed, so a node citing it is not typeless.
+    documented: BTreeSet<String>,
 }
 
 impl Bindings {
@@ -236,6 +262,21 @@ impl Bindings {
     /// metric (63 kernel bindings carry one).
     pub fn dependency_count(&self) -> usize {
         self.schemas.iter().map(|s| s.dependencies.len()).sum()
+    }
+
+    /// Whether the corpus documents `compatible` ANYWHERE — top-level
+    /// binding alternatives AND child-schema positions alike (the
+    /// bondless HINT's sole extra oracle: a child-documented string
+    /// is corpus-governed — job rings, snvs children, idle states
+    /// — so a node citing it is NOT typeless even though no top-level
+    /// view accepts it).
+    pub fn documents(&self, compatible: &str) -> bool {
+        self.documented.contains(compatible)
+    }
+
+    /// Every compatible string the corpus documents — audit metric.
+    pub fn documented_count(&self) -> usize {
+        self.documented.len()
     }
 
     /// Whether any binding data was indexed — completion hints and
@@ -377,7 +418,20 @@ impl Bindings {
         let Some(compatible) = binding.get("properties").and_then(|props| props.get("compatible"))
         else {
             // Schemas without a `compatible` are common-part schemas; they
-            // contribute value candidates instead of matching nodes.
+            // contribute value candidates instead of matching nodes. They
+            // can still carry CHILD positions that document compatible
+            // strings (idle-states.yaml's `arm,idle-state` state nodes) —
+            // harvest those for the bondless oracle before returning.
+            let mut documented = std::mem::take(&mut self.documented);
+            extract_children(
+                binding,
+                &file,
+                &self.roots,
+                &mut self.ref_cache,
+                0,
+                &mut documented,
+            );
+            self.documented = documented;
             self.add_common_schema(binding, &file);
             return;
         };
@@ -432,6 +486,7 @@ impl Bindings {
             &self.roots,
             &mut self.ref_cache,
             0,
+            &mut self.documented,
         );
         self.schemas.push(CompletionSchema {
             file,
@@ -445,12 +500,13 @@ impl Bindings {
             enums: keys,
         });
         let idx = self.schemas.len() - 1;
-        for compatible in compatibles {
+        for compatible in &compatibles {
             self.by_compatible
-                .entry(compatible)
+                .entry(compatible.clone())
                 .or_default()
                 .push(idx);
         }
+        self.documented.extend(compatibles);
     }
 
     /// Hints from common-part schemas merge by property name; `select:
@@ -624,7 +680,10 @@ fn extract_properties(binding: &Value) -> BTreeMap<String, PropertyHint> {
 ///   requirement);
 /// - an `items:` position sequence pins its `const:` positions and
 ///   positionally links its `enum:` positions — const-less sequences
-///   anchor purely through the linked enums;
+///   anchor purely through the linked enums; a PURE-CONST sequence
+///   additionally switches the frame to positional TUPLE acceptance
+///   (`min_prefix`, dt-schema `items:`-array semantics: prefixes of
+///   length >= `minItems:` match, the psci bare `[arm,psci-1.0]`);
 /// - free `enum:` and `contains:` constraints anchor the same way:
 ///   one linked value present (the fsl,imx8-pcie-phy /
 ///   `compatible: enum:` family; `contains: const: X` reduces to
@@ -648,6 +707,11 @@ fn collect_compatible_shapes(
         Value::Mapping(map) => {
             let mut accum = CompatibleShape::default();
             let mut branches = Vec::new();
+            // tuple-mode bookkeeping: a pure-const items tuple's extent
+            // (start, len) within the accumulating consts, plus the
+            // branch's declared `minItems:` (None until seen)
+            let mut tuple_span: Option<(usize, usize)> = None;
+            let mut tuple_min: Option<usize> = None;
             for (key, val) in map.iter() {
                 match key.as_str() {
                     Some("const") => {
@@ -668,6 +732,11 @@ fn collect_compatible_shapes(
                             }
                         }
                     }
+                    Some("minItems") => {
+                        // the positional tuple's length floor — read as a
+                        // SIBLING of `items:` in the same branch frame
+                        tuple_min = val.as_u64().map(|min| min as usize);
+                    }
                     Some("items") => {
                         if let Value::Sequence(items) = val {
                             let mut seq_consts = Vec::new();
@@ -675,6 +744,12 @@ fn collect_compatible_shapes(
                             for item in items {
                                 collect_item_position(item, &mut seq_consts, &mut seq_enums);
                             }
+                            // only a PURE-CONST sequence is positional —
+                            // enum slots make per-position matching
+                            // ambiguous, those frames stay member-pool
+                            tuple_span =
+                                (seq_enums.is_empty() && !seq_consts.is_empty())
+                                    .then_some((accum.consts.len(), seq_consts.len()));
                             accum.consts.extend(seq_consts.iter().cloned());
                             if seq_consts.is_empty() {
                                 // a const-less position sequence anchors
@@ -701,6 +776,7 @@ fn collect_compatible_shapes(
                         if let Value::Sequence(members) = val {
                             for member in members {
                                 for alt in collect_compatible_shapes(member, keys) {
+                                    tuple_span = None;
                                     if branches.is_empty() {
                                         accum.consts.extend(alt.consts);
                                         accum.linked.extend(alt.linked);
@@ -708,6 +784,7 @@ fn collect_compatible_shapes(
                                         for frame in &mut branches {
                                             frame.consts.extend(alt.consts.iter().cloned());
                                             frame.linked.extend(alt.linked.iter().cloned());
+                                            frame.min_prefix = None;
                                         }
                                     }
                                 }
@@ -723,10 +800,12 @@ fn collect_compatible_shapes(
                             if branches.is_empty() {
                                 accum.consts.extend(alt.consts);
                                 accum.linked.extend(alt.linked);
+                                tuple_span = None;
                             } else {
                                 for frame in &mut branches {
                                     frame.consts.extend(alt.consts.iter().cloned());
                                     frame.linked.extend(alt.linked.iter().cloned());
+                                    frame.min_prefix = None;
                                 }
                             }
                         }
@@ -738,10 +817,12 @@ fn collect_compatible_shapes(
                             if branches.is_empty() {
                                 accum.consts.extend(alt.consts);
                                 accum.linked.extend(alt.linked);
+                                tuple_span = None;
                             } else {
                                 for frame in &mut branches {
                                     frame.consts.extend(alt.consts.iter().cloned());
                                     frame.linked.extend(alt.linked.iter().cloned());
+                                    frame.min_prefix = None;
                                 }
                             }
                         }
@@ -749,11 +830,20 @@ fn collect_compatible_shapes(
                 }
             }
             if branches.is_empty() {
-                return if accum.consts.is_empty() && accum.linked.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![accum]
-                };
+                if accum.consts.is_empty() && accum.linked.is_empty() {
+                    return Vec::new();
+                }
+                // flip the pure-tuple frame to positional acceptance
+                // — only when the tuple is the frame's SOLE const source
+                if let Some((start, len)) = tuple_span {
+                    if start == 0
+                        && accum.consts.len() == len
+                        && accum.linked.is_empty()
+                    {
+                        accum.min_prefix = Some(tuple_min.unwrap_or(0));
+                    }
+                }
+                return vec![accum];
             }
             if !accum.consts.is_empty() || !accum.linked.is_empty() {
                 // a const pinned beside a disjunction conjoins with
@@ -761,6 +851,7 @@ fn collect_compatible_shapes(
                 for frame in &mut branches {
                     frame.consts.extend(accum.consts.iter().cloned());
                     frame.linked.extend(accum.linked.iter().cloned());
+                    frame.min_prefix = None;
                 }
             }
             branches
@@ -1156,6 +1247,7 @@ fn extract_children(
     roots: &[PathBuf],
     ref_cache: &mut HashMap<PathBuf, Value>,
     depth: usize,
+    documented: &mut BTreeSet<String>,
 ) -> Vec<ChildSchema> {
     const MAX_DEPTH: usize = 4;
     if depth > MAX_DEPTH {
@@ -1177,6 +1269,7 @@ fn extract_children(
             roots,
             ref_cache,
             depth,
+            documented,
         );
         if let Some(existing) = children
             .iter_mut()
@@ -1205,8 +1298,22 @@ fn child_schema_for(
     roots: &[PathBuf],
     ref_cache: &mut HashMap<PathBuf, Value>,
     depth: usize,
+    documented: &mut BTreeSet<String>,
 ) -> ChildSchema {
     let heads = flat_views(subschema, origin_file, ref_cache, roots);
+    for (view, _) in &heads {
+        // a child's own `compatible` documents its strings — even
+        // though they never anchor a top-level view, the corpus
+        // justifies them in child position (the jr job rings, the
+        // snvs children, arm,idle-state state nodes)
+        if let Some(compatible) = view.get("properties").and_then(|props| props.get("compatible")) {
+            let mut keys = Vec::new();
+            for shape in collect_compatible_shapes(compatible, &mut keys) {
+                documented.extend(shape.consts.iter().cloned());
+                documented.extend(shape.linked.iter().cloned());
+            }
+        }
+    }
     let mut properties: BTreeMap<String, PropertyHint> = BTreeMap::new();
     for (view, _) in &heads {
         for (name, hint) in extract_properties(view) {
@@ -1218,7 +1325,7 @@ fn child_schema_for(
             properties.entry(name).or_default().required = true;
         }
     }
-    let children = extract_children(subschema, origin_file, roots, ref_cache, depth + 1);
+    let children = extract_children(subschema, origin_file, roots, ref_cache, depth + 1, documented);
     ChildSchema {
         patterns,
         properties,
@@ -1527,6 +1634,29 @@ fn collect_value_strings(value: &Value, out: &mut Vec<String>) {
                         }
                     }
                     Some("properties" | "patternProperties" | "examples") => {}
+                    Some("default") => {
+                        // the binding's canonical spelling for this
+                        // property — one more string candidate (snvs
+                        // `clock-names: const: snvs-rtc +
+                        // default: snvs-rtc` — deduped against the
+                        // enum/const pool above). Only this level:
+                        // nested CHILD defaults never leak into the
+                        // parent's pool (the skipped keys above guard
+                        // the deep paths)
+                        if let Value::Sequence(items) = val {
+                            for item in items {
+                                if let Some(scalar) = scalar_string(item) {
+                                    if !out.contains(&scalar) {
+                                        out.push(scalar);
+                                    }
+                                }
+                            }
+                        } else if let Some(scalar) = scalar_string(val) {
+                            if !out.contains(&scalar) {
+                                out.push(scalar);
+                            }
+                        }
+                    }
                     _ => collect_value_strings(val, out),
                 }
             }
@@ -1718,6 +1848,158 @@ properties:
 
         assert_eq!(bindings.schema_count(), 0);
         assert!(bindings.properties_for(&["whatever".to_string()]).is_empty());
+    }
+
+    const PSCI_BINDING: &str = r#"
+properties:
+  compatible:
+    oneOf:
+      - const: vendor,psci
+      - minItems: 1
+        items:
+          - const: vendor,psci-1.0
+          - const: vendor,psci-0.2
+          - const: vendor,psci
+required:
+  - compatible
+"#;
+
+    #[test]
+    pub fn min_items_tuple_accepts_positional_prefixes() {
+        // the psci.yaml form: a pure-const `items:` tuple with a
+        // `minItems:` floor takes dt-schema TUPLE semantics — every
+        // prefix of the tuple with a length of at least minItems
+        // matches, POSITIONALLY. The bare `[vendor,psci-1.0]`
+        // cites the real mainline psci idiom; tail consts alone or
+        // re-ordered lists never do (pooling would be the round-1
+        // imposter flood)
+        let binding: Value = serde_yaml::from_str(PSCI_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("arm/psci.yaml"), &binding);
+        // the bare prefix SHOULD govern: the view exists and binds the
+        // psci.yaml file stem (attribution for its requirement lists)
+        let views = bindings.normative_views(&["vendor,psci-1.0".to_string()]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].0, "psci");
+        // positional prefixes of length 2 and the full tuple alike
+        assert!(!bindings
+            .normative_views(&["vendor,psci-1.0".to_string(), "vendor,psci-0.2".to_string()])
+            .is_empty());
+        assert!(!bindings.normative_views(&[
+            "vendor,psci-1.0".to_string(),
+            "vendor,psci-0.2".to_string(),
+            "vendor,psci".to_string(),
+        ])
+        .is_empty());
+        // tail consts alone never anchor the tuple branch
+        assert!(bindings
+            .normative_views(&["vendor,psci-0.2".to_string()])
+            .is_empty());
+        // re-ordering is positional nonsense: rejected
+        assert!(bindings
+            .normative_views(&[
+                "vendor,psci-0.2".to_string(),
+                "vendor,psci-1.0".to_string(),
+            ])
+            .is_empty());
+    }
+
+    const MON_BINDING: &str = r#"
+properties:
+  compatible:
+    items:
+      - const: vendor,sec-mon
+      - const: syscon
+  snvs-rtc-lp:
+    type: object
+    properties:
+      compatible:
+        const: vendor,sec-mon-rtc-lp
+      interrupts:
+        maxItems: 2
+"#;
+
+    #[test]
+    pub fn child_positions_document_without_becoming_views() {
+        // the fsl,sec-v4.0-mon shape: the file's child schema carries
+        // its own compatible const. That string marks corpus-known —
+        // the bondless HINT stays silent for it — but it NEVER anchors
+        // a normative view: acceptance still runs the TOP-LEVEL shape
+        // (the sec-mon tuple), so the imposter-flood protection holds
+        let binding: Value = serde_yaml::from_str(MON_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("crypto/vendor,sec-mon.yaml"), &binding);
+        assert!(bindings.documents("vendor,sec-mon-rtc-lp"));
+        assert!(!bindings.documents("vendor,unknown-thing"));
+        assert!(bindings
+            .normative_views(&["vendor,sec-mon-rtc-lp".to_string()])
+            .is_empty());
+    }
+
+    const IDLE_STATES_BINDING: &str = r#"
+properties:
+  $nodename:
+    const: idle-states
+patternProperties:
+  "^(cpu|cluster)-":
+    type: object
+    properties:
+      compatible:
+        enum:
+          - vendor,idle-state
+"#;
+
+    #[test]
+    pub fn name_governed_bindings_document_child_compatible_strings() {
+        // the idle-states.yaml shape: NO top-level compatible (a
+        // name-governed binding — common-part path), yet its
+        // patternProperties children document their compatible
+        // strings for the bondless oracle (`arm,idle-state` on real
+        // stock trees)
+        let binding: Value = serde_yaml::from_str(IDLE_STATES_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("cpu/idle-states.yaml"), &binding);
+        assert!(bindings.documents("vendor,idle-state"));
+        assert!(!bindings.documents("vendor,cluster-never"));
+    }
+
+    const DEFAULTS_BINDING: &str = r#"
+properties:
+  compatible:
+    const: vendor,dev
+  clock-names:
+    items:
+      - const: enabled
+      - const: disabled
+    default: [ enabled, disabled ]
+  mode:
+    enum:
+      - host
+    default: host
+  spare:
+    description: canonical spelling only
+    default: lone-spelling
+"#;
+
+    #[test]
+    pub fn default_values_join_the_candidate_pool() {
+        // a `default:` names the binding's canonical spelling — it
+        // joins the string candidates (deduplicated against the
+        // enum/const pool) without ever widening acceptance; a
+        // default-only property finally has a candidate at all
+        let binding: Value = serde_yaml::from_str(DEFAULTS_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("vendor/defaults.yaml"), &binding);
+        let properties = bindings.properties_for(&["vendor,dev".to_string()]);
+        let clock_names = &properties["clock-names"];
+        assert_eq!(
+            clock_names.values,
+            vec!["enabled".to_string(), "disabled".to_string()]
+        );
+        let mode = &properties["mode"];
+        assert_eq!(mode.values, vec!["host".to_string()]);
+        let spare = &properties["spare"];
+        assert_eq!(spare.values, vec!["lone-spelling".to_string()]);
     }
 
     const VALUES_BINDING: &str = r#"

@@ -34,6 +34,13 @@ use std::path::Path;
 ///   superseded — Hint (quiet by default: historical stock-tree uses
 ///   aren't user error), attributed to the deprecating binding,
 ///   anchored at the property itself.
+/// - no-binding-matched: a compatible-bearing node matches no indexed
+///   binding at all (every alternative rejected) AND cites at least one
+///   string even the corpus child positions never justify — Hint,
+///   anchored at the identity anchor, listing exactly the
+///   never-documented strings (child-position compatibles are
+///   corpus-governed per their parent's binding: job rings, snvs
+///   children, idle states — upstream corpus debt, not user error).
 pub fn binding_diagnostics(
     tree: &ResolvedTree,
     file: &Path,
@@ -83,8 +90,31 @@ fn check_node(
     }
     let views = bindings.normative_views(&compatibles);
     if views.is_empty() {
-        // no binding matched — unmatched-compatible notices are deferred;
-        // bondless nodes must stay silent
+        // no binding matched — the node cites compatible strings the
+        // indexed bindings never justify. Hint, not Warning: a missing
+        // binding is upstream corpus debt, not user error (dt-schema
+        // reports these too). Child-position strings are excluded
+        // first: a compatible the corpus documents ANYWHERE (as a
+        // job-ring, an snvss child, an idle state — governed by its
+        // PARENT's binding) is corpus-known, its node not typeless;
+        // only strings even the children never justify are reported.
+        let unknown: Vec<&String> = compatibles
+            .iter()
+            .filter(|compatible| !bindings.documents(compatible))
+            .collect();
+        if !unknown.is_empty() {
+            let joined = unknown
+                .iter()
+                .map(|compatible| format!("`{compatible}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(Diagnostic::new(
+                identity.name.span(),
+                identity.end.source(),
+                ErrorCode::CustomHint,
+                format!("no binding matched for {joined}"),
+            ));
+        }
         return;
     }
     // required entries are judged PER BINDING so the message names the
@@ -403,10 +433,11 @@ properties:
         let diags = diags_for(&project, &paths[0], &bindings);
         // good@1 clean (req-prop as property, sub as CHILD node,
         // allow-prop spelled `true` = allowed-unconstrained, not boolean);
-        // unmatched@3 has no binding (silent); plain@4 compatible-less;
+        // unmatched@3 now carries the no-binding-matched HINT (the last
+        // deferred diagnostics class); plain@4 compatible-less (silent);
         // bad@2 fires the four warning checks plus the deprecated HINT
         // on old-prop
-        assert_eq!(diags.len(), 6, "{:#?}", diags);
+        assert_eq!(diags.len(), 7, "{:#?}", diags);
         let compat_line = text.lines().position(|l| l.contains("bad@2")).unwrap();
         let by_kind = |code: ErrorCode| {
             diags
@@ -414,6 +445,11 @@ properties:
                 .filter(|d| d.kind == code)
                 .collect_vec()
         };
+        let bondless = by_kind(ErrorCode::CustomHint)
+            .into_iter()
+            .filter(|d| d.message.contains("no binding matched for `vendor,404`"))
+            .count();
+        assert_eq!(bondless, 1, "{:#?}", diags);
         let required = by_kind(ErrorCode::CustomWarning)
             .into_iter()
             .filter(|d| d.message.contains("requires property"))
@@ -437,7 +473,10 @@ properties:
             .filter(|d| d.message.contains("boolean"))
             .collect_vec();
         assert_eq!(bare.len(), 1);
-        let deprecated = by_kind(ErrorCode::CustomHint);
+        let deprecated = by_kind(ErrorCode::CustomHint)
+            .into_iter()
+            .filter(|d| d.message.contains("is deprecated"))
+            .collect_vec();
         // deprecated-use is a Hint: bad@2's old-prop fires exactly once,
         // attributed, anchored at the property — good@1's clean node and
         // the stock idiom tolerance live in the gate's allowlist instead
@@ -466,6 +505,63 @@ properties:
     }
 
     #[test]
+    pub fn bondless_hint_spares_child_position_strings() {
+        // the job-ring / snvs-child / idle-state shape: a binding
+        // documents a compatible string in CHILD position — the node
+        // citing it is governed by its PARENT's binding, never bondless.
+        // A string NOWHERE justified still fires the hint (zulu's
+        // usb0424,2512 typo idiom), and only the strings the corpus
+        // never documents are listed
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,sec-mon.yaml"),
+            r#"
+properties:
+  compatible:
+    items:
+      - const: vendor,sec-mon
+      - const: syscon
+  snvs-rtc-lp:
+    type: object
+    properties:
+      compatible:
+        const: vendor,sec-mon-rtc-lp
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tmon@1 {\n",
+            "\t\tcompatible = \"vendor,sec-mon\", \"syscon\";\n",
+            "\t\tsnvs-rtc-lp {\n",
+            "\t\t\tcompatible = \"vendor,sec-mon-rtc-lp\";\n",
+            "\t\t};\n",
+            "\t};\n",
+            "\tmixed@2 {\n",
+            "\t\tcompatible = \"vendor,sec-mon-rtc-lp\", \"vendor,404\";\n",
+            "\t};\n",
+            "\ttypeless@3 {\n",
+            "\t\tcompatible = \"vendor,404\";\n",
+            "\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        // exactly two reports: mixed@2 lists only its never-documented
+        // string, typeless@3 fires on its lone unknown
+        assert_eq!(diags.len(), 2, "{diags:#?}");
+        assert!(diags[0]
+            .message
+            .contains("no binding matched for `vendor,404`"));
+        assert_eq!(diags[0].span.start().line() as usize, 10);
+        assert!(diags[1]
+            .message
+            .contains("no binding matched for `vendor,404`"));
+        assert_eq!(diags[1].span.start().line() as usize, 13);
+    }
+
+    #[test]
     pub fn missing_required_anchors_the_identity_file_only() {
         // each file is judged standing alone: its own include closure.
         // the includer never owns the base node's diagnostics — the base
@@ -483,6 +579,27 @@ properties:
         assert!(base_diags[0].source.ends_with("base.dtsi"));
         // main.dts: the node's identity lives in base.dtsi, and its own
         // tree is complete anyway -> silent
+        assert!(diags_for(&project, &paths[1], &bindings).is_empty());
+    }
+
+    #[test]
+    pub fn no_binding_matched_hint_follows_identity_and_bindless_rules() {
+        // the HINT inherits the same discipline as every binding
+        // diagnostic: identity-file ownership (defined-in-base, reported
+        // only by the base pass), bindless-index silence, and
+        // compatible-less-node silence
+        let base =
+            "/dts-v1/;\n\n/ {\n\tnoded: base@1 {\n\t\tcompatible = \"vendor,404\";\n\t};\n\n\tplain@2 {\n\t\treg = <1>;\n\t};\n};\n";
+        let main = "/dts-v1/;\n\n#include \"base.dtsi\"\n\n&noded {\n\tflag;\n};\n";
+        let (project, _temp, paths) = open_project(&[("base.dtsi", base), ("main.dts", main)]);
+        let bindings = dev_bindings();
+        let base_diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(base_diags.len(), 1, "{base_diags:#?}");
+        assert_eq!(base_diags[0].kind, ErrorCode::CustomHint);
+        assert!(base_diags[0]
+            .message
+            .contains("no binding matched for `vendor,404`"));
+        assert!(base_diags[0].source.ends_with("base.dtsi"));
         assert!(diags_for(&project, &paths[1], &bindings).is_empty());
     }
 
@@ -742,7 +859,15 @@ required:
             "test.dts",
             "/dts-v1/;\n\n/ {\n\tphy@1 {\n\t\tcompatible = \"vendor,unrelated\", \"syscon\";\n\t};\n};\n",
         )]);
-        assert!(diags_for(&project, &paths[0], &bindings).is_empty());
+        // no match anywhere — since the bondless round that is no longer
+        // silence: the node cites strings the index never justifies, one
+        // HINT listing every compatible exactly as cited
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(diags[0].kind, ErrorCode::CustomHint);
+        assert!(diags[0]
+            .message
+            .contains("no binding matched for `vendor,unrelated`, `syscon`"));
     }
 
     #[test]
