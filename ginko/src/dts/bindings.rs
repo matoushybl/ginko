@@ -71,6 +71,21 @@ pub struct Conditional {
     pub properties: BTreeMap<String, PropertyHint>,
 }
 
+/// One `oneOf`/`anyOf` requirement disjunction — every member is a
+/// pure `required:` list (the `​interrupts` vs
+/// `​interrupts-extended` idiom, `clocks` vs `power-domains`, `volid` vs
+/// `volname`): a governed node must satisfy AT LEAST ONE branch
+/// (anyOf semantics — carrying several stays silent, the
+/// conservative reading). Branches with property constraints mixed
+/// in opt the whole disjunction out: a pure-required reading there
+/// would misjudge refinements as requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RequirementAlternation {
+    /// One branch per pure-required member — a branch is satisfied
+    /// when the node carries every name (property OR child node).
+    pub branches: Vec<Vec<String>>,
+}
+
 /// A binding file distilled to completion data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionSchema {
@@ -89,6 +104,9 @@ pub struct CompletionSchema {
     /// members carrying a then-required list) — applied by the
     /// validator when the node's compatibles match the condition.
     pub conditionals: Vec<Conditional>,
+    /// `oneOf`/`anyOf` pure-required disjunctions — the validator
+    /// flags a governed node satisfying NONE of the branches.
+    pub requirement_alternations: Vec<RequirementAlternation>,
     /// All `enum:` values — index suggestion keys only; never a
     /// constraint (completion keeps the v1 over-collection).
     pub enums: Vec<String>,
@@ -191,6 +209,15 @@ impl Bindings {
     /// conditional-round parse (~240 kernel bindings carry one).
     pub fn conditional_count(&self) -> usize {
         self.schemas.iter().map(|s| s.conditionals.len()).sum()
+    }
+
+    /// Every parsed pure-required `oneOf`/`anyOf` disjunction — the
+    /// audit metric for the either/or round (~60 kernel bindings).
+    pub fn disjunction_count(&self) -> usize {
+        self.schemas
+            .iter()
+            .map(|s| s.requirement_alternations.len())
+            .sum()
     }
 
     /// Whether any binding data was indexed — completion hints and
@@ -358,6 +385,7 @@ impl Bindings {
             return;
         }
         let mut conditionals = Vec::new();
+        let mut alternations = Vec::new();
         let properties = {
             let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
             for (view, _) in
@@ -367,6 +395,7 @@ impl Bindings {
                     merge_hint(merged.entry(name.clone()).or_default(), &hint);
                 }
                 collect_conditionals(&view, &mut conditionals);
+                collect_requirement_alternations(&view, &mut alternations);
             }
             merged
         };
@@ -383,6 +412,7 @@ impl Bindings {
             children,
             alternatives,
             conditionals,
+            requirement_alternations: alternations,
             enums: keys,
         });
         let idx = self.schemas.len() - 1;
@@ -780,6 +810,66 @@ fn collect_conditionals(view: &Value, out: &mut Vec<Conditional>) {
         shapes,
         properties: overlay,
     });
+}
+
+/// Extract a `oneOf`/`anyOf` REQUIREMENT disjunction from one flat
+/// view of a binding: every member must be a pure `required:` list
+/// (a `deprecated: true` tag tolerates) and there must be at least
+/// two members — a member carrying property constraints opts the
+/// whole disjunction out, since a bare-required reading would
+/// misjudge value refinements as requirements. Collected from every
+/// flat view, so `allOf`-embedded disjunctions and $ref-inherited
+/// ones land identically.
+fn collect_requirement_alternations(
+    view: &Value,
+    out: &mut Vec<RequirementAlternation>,
+) {
+    for key in ["oneOf", "anyOf"] {
+        let Some(Value::Sequence(members)) = view.get(key) else {
+            continue;
+        };
+        if members.len() < 2 {
+            continue;
+        }
+        let Some(branches) = pure_required_branches(members) else {
+            continue;
+        };
+        out.push(RequirementAlternation { branches });
+    }
+}
+
+/// The pure-required member set of one disjunction, or None when any
+/// member carries property constraints, is empty or scalar — in those
+/// shapes a bare-required reading would misjudge value refinements as
+/// requirements, so the whole disjunction stays out.
+fn pure_required_branches(members: &[Value]) -> Option<Vec<Vec<String>>> {
+    let mut branches = Vec::new();
+    for member in members {
+        let Value::Mapping(map) = member else {
+            return None;
+        };
+        if map.is_empty() {
+            return None; // a `{}` member satisfies trivially
+        }
+        let Some(Value::Sequence(required)) = map.get("required") else {
+            return None;
+        };
+        for k in map.keys() {
+            if !matches!(k.as_str(), Some("required" | "deprecated")) {
+                return None; // property-refining member — not pure
+            }
+        }
+        let names: Vec<String> = required
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        branches.push(names);
+    }
+    Some(branches)
 }
 
 fn property_hint(sub: &Value, required: bool) -> PropertyHint {

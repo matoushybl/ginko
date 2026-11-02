@@ -104,12 +104,13 @@ impl Backend {
         let paths: Vec<PathBuf> = binding_paths.iter().map(PathBuf::from).collect();
         self.bindings = Bindings::from_paths(&paths);
         tracing::info!(
-            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas, {} conditionals",
+            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas, {} conditionals, {} disjunctions",
             self.bindings.schema_count(),
             self.bindings.compatible_count(),
             self.bindings.common_prop_count(),
             self.bindings.child_schema_count(),
-            self.bindings.conditional_count()
+            self.bindings.conditional_count(),
+            self.bindings.disjunction_count()
         );
         self
     }

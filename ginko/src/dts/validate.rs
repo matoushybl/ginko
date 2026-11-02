@@ -21,8 +21,12 @@ use std::path::Path;
 ///   Warning, anchored at the property.
 /// - string-enum-mismatch: a string value of a property with known
 ///   candidates (matched binding enum, else the select:true universal
-///   pool — dtschema's dt-core) matches none — Warning, anchored at the
-///   value.
+///   pool — dtschema's dt-core) matches none — Warning, anchored at
+///   the value.
+/// - requirement-alternation: a pure-required `oneOf`/`anyOf` none of
+///   whose branches the node satisfies (neither `interrupts` nor
+///   `interrupts-extended`) — Warning, anchored at the `compatible`,
+///   at-least-one semantics: carrying several branches stays silent.
 /// - deprecated-use: DEFERRED to a policy round — stock in-tree dtsi
 ///   legitimately carries deprecated idioms.
 pub fn binding_diagnostics(
@@ -115,6 +119,38 @@ fn check_node(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut V
                     format!("binding `{binding}` requires property `{name}`"),
                 ));
             }
+        }
+        // requirement disjunctions: a governed node must satisfy AT
+        // LEAST ONE pure-required branch (the `interrupts` vs
+        // `interrupts-extended` idiom, `clocks` vs `power-domains`) —
+        // carrying several stays silent, the conservative reading
+        for alternation in &schema.requirement_alternations {
+            let satisfied = alternation.branches.iter().any(|branch| {
+                branch.iter().all(|name| {
+                    node.get_property(name).is_some() || node.child_exists(name)
+                })
+            });
+            if satisfied {
+                continue;
+            }
+            let expected = alternation
+                .branches
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(Diagnostic::new(
+                identity.name.span(),
+                identity.end.source(),
+                ErrorCode::CustomWarning,
+                format!("binding `{binding}` requires one of: {expected}"),
+            ));
         }
     }
     let hints = bindings.normative_properties_for(&compatibles);
@@ -786,5 +822,125 @@ allOf:
         assert!(diags[0]
             .message
             .contains("unknown value `wrong` for property `mode-prop` — expected one of: turbo, hyperspeed"));
+    }
+
+    #[test]
+    pub fn requirement_alternations_enforce_either_or() {
+        // the either/or round: pure-required oneOf/anyOf members bind
+        // at-least-one semantics (carrying several branches stays
+        // silent); branches may carry multiple names (joined with +,
+        // satisfied by property OR child node); a member with property
+        // constraints opts the WHOLE disjunction out — a bare-required
+        // reading would misjudge refinement as requirement
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,either.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,either
+  interrupts:
+    description: classic interrupt parent link
+  interrupts-extended:
+    description: extended interrupt parent link
+required:
+  - compatible
+oneOf:
+  - required:
+      - interrupts
+  - required:
+      - interrupts-extended
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("vendor,multi.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,multi
+  a: true
+  b: true
+  c: true
+required:
+  - compatible
+oneOf:
+  - required:
+      - a
+      - b
+  - required:
+      - c
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("vendor,duality.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,duality
+  supply:
+    description: node property duality counterpart
+required:
+  - compatible
+anyOf:
+  - required:
+      - regulators
+  - required:
+      - supply
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("vendor,trap.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,trap
+  interrupts:
+    description: property-constrained branch member below
+  interrupts-extended:
+    description: the pure member
+required:
+  - compatible
+oneOf:
+  - properties:
+      compatible:
+        const: vendor,trap
+    required:
+      - interrupts
+  - required:
+      - interrupts-extended
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tvia-interrupts {\n\t\tcompatible = \"vendor,either\";\n\t\tinterrupts = <1 2>;\n\t};\n",
+            "\tvia-extended {\n\t\tcompatible = \"vendor,either\";\n\t\tinterrupts-extended = <&intc 3>;\n\t};\n",
+            "\tvia-none {\n\t\tcompatible = \"vendor,either\";\n\t};\n",
+            "\tmulti-ok {\n\t\tcompatible = \"vendor,multi\";\n\t\ta; b;\n\t};\n",
+            "\tmulti-partial {\n\t\tcompatible = \"vendor,multi\";\n\t\ta;\n\t};\n",
+            "\tduality-ok {\n\t\tcompatible = \"vendor,duality\";\n\t\tregulators {\n\t\t};\n\t};\n",
+            "\ttrap-silent {\n\t\tcompatible = \"vendor,trap\";\n\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        // exactly the two violated alternatives fire — satisfied
+        // branches (property, child-duality) add NOTHING, and the
+        // impure-member oneOf was never collected (no vendor,trap
+        // diagnostics at all)
+        assert_eq!(diags.len(), 2, "{:#?}", diags);
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains(
+                "binding `vendor,either` requires one of: `interrupts`, `interrupts-extended`",
+            )));
+        assert!(diags.iter().any(|d| d.message.contains(
+            "binding `vendor,multi` requires one of: `a` + `b`, `c`",
+        )));
+        assert!(diags.iter().all(|d| !d.message.contains("vendor,trap")), "{:#?}", diags);
     }
 }
