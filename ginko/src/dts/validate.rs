@@ -1,5 +1,5 @@
 use crate::dts::ast::PropertyValue;
-use crate::dts::bindings::{node_compatibles, shape_satisfied, Bindings};
+use crate::dts::bindings::{name_matches, node_compatibles, shape_satisfied, Bindings};
 use crate::dts::diagnostics::Diagnostic;
 use crate::dts::error_codes::ErrorCode;
 use crate::dts::resolved::{ResolvedNode, ResolvedTree};
@@ -38,18 +38,31 @@ pub fn binding_diagnostics(
         return Vec::new();
     }
     let mut out = Vec::new();
-    walk(tree.root(), file, bindings, &mut out);
+    walk(tree.root(), "", file, bindings, &mut out);
     out
 }
 
-fn walk(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut Vec<Diagnostic>) {
-    check_node(node, file, bindings, out);
-    for child in node.active_children() {
-        walk(child, file, bindings, out);
+fn walk(
+    node: &ResolvedNode,
+    name: &str,
+    file: &Path,
+    bindings: &Bindings,
+    out: &mut Vec<Diagnostic>,
+) {
+    check_node(node, name, file, bindings, out);
+    for (child_name, child) in node.active_child_entries() {
+        let child_name = child_name.to_string();
+        walk(child, &child_name, file, bindings, out);
     }
 }
 
-fn check_node(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut Vec<Diagnostic>) {
+fn check_node(
+    node: &ResolvedNode,
+    name: &str,
+    file: &Path,
+    bindings: &Bindings,
+    out: &mut Vec<Diagnostic>,
+) {
     let compatibles = node_compatibles(node);
     if compatibles.is_empty() {
         return;
@@ -151,6 +164,23 @@ fn check_node(node: &ResolvedNode, file: &Path, bindings: &Bindings, out: &mut V
                 ErrorCode::CustomWarning,
                 format!("binding `{binding}` requires one of: {expected}"),
             ));
+        }
+        // $nodename shaping: the binding's `properties.$nodename`
+        // constrains the NAME of the nodes it governs — the LENIENT
+        // matcher (the same one child-name completion uses) means a
+        // rejection is really a mismatch; a miss here can never be a
+        // false positive
+        if let Some(pattern) = &schema.nodename {
+            if !name_matches(pattern, name) {
+                out.push(Diagnostic::new(
+                    identity.name.span(),
+                    identity.end.source(),
+                    ErrorCode::CustomWarning,
+                    format!(
+                        "node name `{name}` does not match `{pattern}` — binding `{binding}`"
+                    ),
+                ));
+            }
         }
     }
     let hints = bindings.normative_properties_for(&compatibles);
@@ -942,5 +972,124 @@ oneOf:
             "binding `vendor,multi` requires one of: `a` + `b`, `c`",
         )));
         assert!(diags.iter().all(|d| !d.message.contains("vendor,trap")), "{:#?}", diags);
+    }
+
+    #[test]
+    pub fn nodename_patterns_judge_governed_nodes() {
+        // $nodename shaping: the binding's properties.$nodename pattern
+        // constrains the NAME of governed nodes — matched names stay
+        // silent (unit addresses tolerated through the lenient matcher),
+        // a mismatch fires with the node's own name and the pattern,
+        // attributed to the binding; pattern-less bindings and const^$
+        // roots stay untouched
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,dev.yaml"),
+            r#"
+properties:
+  $nodename:
+    pattern: "^dev(@[0-9a-f]+)?$"
+  compatible:
+    const: vendor,dev
+required:
+  - compatible
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("vendor,bare.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,bare
+required:
+  - compatible
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tdev {\n\t\tcompatible = \"vendor,dev\";\n\t};\n",
+            "\tdev@f00d {\n\t\tcompatible = \"vendor,dev\";\n\t};\n",
+            "\tdev@badname {\n\t\tcompatible = \"vendor,dev\";\n\t};\n",
+            "\tbare-whatever {\n\t\tcompatible = \"vendor,bare\";\n\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        // EXACT regex semantics: bare `dev` and `dev@f00d` match
+        // `^dev(@[0-9a-f]+)?$`; dev@badname REJECTS — its unit segment
+        // is not hex (`badname`'s n is outside [0-9a-f]) — the exact
+        // match the lenient completion matcher deliberately cannot
+        // deliver; vendor,bare never defines a pattern
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.message.contains("does not match"))
+                .count(),
+            1,
+            "{:#?}",
+            diags
+        );
+        assert!(diags[0].message.contains(
+            "node name `dev@badname` does not match `^dev(@[0-9a-f]+)?$` — binding `vendor,dev`"
+        ));
+        // the definite rejection: a name missing the anchored `dev`
+        // run entirely — exactly one diagnostic, attributed, anchored
+        // at the node's compatible line
+        let text_two = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\twrongname@1 {\n\t\tcompatible = \"vendor,dev\";\n\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text_two)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(diags.len(), 1, "{:#?}", diags);
+        assert!(diags[0].message.contains(
+            "node name `wrongname@1` does not match `^dev(@[0-9a-f]+)?$` — binding `vendor,dev`"
+        ));
+        let expected_line = text_two
+            .lines()
+            .position(|l| l.contains("vendor,dev"))
+            .unwrap();
+        assert_eq!(diags[0].span.start().line() as usize, expected_line);
+        // the gate-found bug class as a regression: real $nodename
+        // patterns carry `|` ALTERNATIVES (simple-bus's
+        // `^([a-z][a-z0-9\-]+-bus|bus|soc)(@.+)?$`) — each member must
+        // be judged on its own, never the whole pattern as one regex
+        fs::write(
+            dir.path().join("vendor,buses.yaml"),
+            r#"
+properties:
+  $nodename:
+    pattern: '^([a-z][a-z0-9\-]+-bus|bus|soc)(@.+)?$'
+  compatible:
+    const: vendor,buses
+required:
+  - compatible
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let text_three = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tsoc@0 {\n\t\tcompatible = \"vendor,buses\";\n\t};\n",
+            "\tspba-bus@30000000 {\n\t\tcompatible = \"vendor,buses\";\n\t};\n",
+            "\tbus@30400000 {\n\t\tcompatible = \"vendor,buses\";\n\t};\n",
+            "\twrongnode@1 {\n\t\tcompatible = \"vendor,buses\";\n\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text_three)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        // every alternative member accepts its names leniently
+        // (`soc@0`, `bus@…`, `spba-bus@…` all hit a member); only a
+        // name outside ALL members fires — the alternatives-split is
+        // exactly what the gate found missing (whole-pattern-as-one
+        // regex rejected soc@0 and bus@30400000 outright)
+        assert_eq!(diags.len(), 1, "{:#?}", diags);
+        assert!(diags[0].message.contains(
+            "node name `wrongnode@1` does not match `^([a-z][a-z0-9\\-]+-bus|bus|soc)(@.+)?$` — binding `vendor,buses`"
+        ));
     }
 }

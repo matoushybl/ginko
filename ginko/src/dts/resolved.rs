@@ -98,6 +98,18 @@ impl ResolvedNode {
             .map(|(_, child)| child)
     }
 
+    /// The node's live children with their NAMES paired — for passes
+    /// that judge the name and the node together ($nodename shaping:
+    /// the validator needs what a node is called, which
+    /// `active_children` alone cannot hand over).
+    pub fn active_child_entries<'a>(
+        &'a self,
+    ) -> impl Iterator<Item = (&'a NodeName, &'a ResolvedNode)> + use<'a> {
+        self.children
+            .iter()
+            .filter(|(_, child)| !child.deleted)
+    }
+
     pub fn get_property(&self, name: &str) -> Option<&ResolvedProperty> {
         self.properties.get(name)
     }

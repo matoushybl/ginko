@@ -107,6 +107,12 @@ pub struct CompletionSchema {
     /// `oneOf`/`anyOf` pure-required disjunctions — the validator
     /// flags a governed node satisfying NONE of the branches.
     pub requirement_alternations: Vec<RequirementAlternation>,
+    /// The binding's `properties.$nodename` name constraint (pattern-
+    /// or const-form) — a governed node's NAME must match, judged by
+    /// the LENIENT literal-run matcher (fewer violations, never a
+    /// false positive — the same matcher child-name completion uses).
+    /// An overlay-merged node carries each spelling's pattern.
+    pub nodename: Option<String>,
     /// All `enum:` values — index suggestion keys only; never a
     /// constraint (completion keeps the v1 over-collection).
     pub enums: Vec<String>,
@@ -386,11 +392,18 @@ impl Bindings {
         }
         let mut conditionals = Vec::new();
         let mut alternations = Vec::new();
+        let mut nodename = None;
         let properties = {
             let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
             for (view, _) in
                 flat_views(binding, &file, &mut self.ref_cache, &self.roots)
             {
+                if nodename.is_none() {
+                    // the binding's own view comes first (flat_views pops
+                    // the top before its allOf/refs) — $ref-inherited
+                    // $nodenames only fill the gap
+                    nodename = extract_nodename(&view);
+                }
                 for (name, hint) in extract_properties(&view) {
                     merge_hint(merged.entry(name.clone()).or_default(), &hint);
                 }
@@ -413,6 +426,7 @@ impl Bindings {
             alternatives,
             conditionals,
             requirement_alternations: alternations,
+            nodename,
             enums: keys,
         });
         let idx = self.schemas.len() - 1;
@@ -764,6 +778,31 @@ fn collect_item_position(item: &Value, consts: &mut Vec<String>, enums: &mut Vec
             }
             _ => {}
         }
+    }
+}
+
+/// The `properties.$nodename` constraint of one flat view — the
+/// NAME shape of the nodes a binding governs (a sibling key of
+/// `compatible`, which is why the property extractor skips `$`-meta
+/// names). The `pattern:` spelling lands as-is; `const:` becomes
+/// `^<const>$` (dt-schema's exact-name reading; the living corpus uses
+/// it only for root-node schemas, which carry no compatible).
+fn extract_nodename(view: &Value) -> Option<String> {
+    let nodename = view
+        .get("properties")?
+        .get("$nodename")?;
+    match nodename {
+        Value::Mapping(map) => {
+            if let Some(Value::String(pattern)) = map.get("pattern") {
+                Some(pattern.clone())
+            } else if let Some(Value::String(exact)) = map.get("const") {
+                Some(format!("^{exact}$"))
+            } else {
+                None
+            }
+        }
+        Value::String(pattern) => Some(pattern.clone()),
+        _ => None,
     }
 }
 
@@ -1300,6 +1339,31 @@ fn pattern_matches(patterns: &[String], node_name: &str) -> bool {
     patterns
         .iter()
         .any(|pattern| alternative_matches(pattern, node_name))
+}
+
+/// Whether a NODE NAME satisfies a `$nodename` pattern — EXACT regex
+/// semantics (the corpus patterns are true regexes: alternatives,
+/// classes, `{1,2}` quantifiers, tail groups — a naive `|` split
+/// mangles the `(A|B)(@…)?$` wrapper). Compiled once per distinct
+/// pattern; a pattern regex can't parse falls back to the LENIENT
+/// child-name matcher. The sibling `alternative_matches` stays the
+/// over-matching COMPLETION matcher and never judges validation.
+pub fn name_matches(pattern: &str, name: &str) -> bool {
+    static NODENAME_REGEXES: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<String, Option<regex::Regex>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = NODENAME_REGEXES
+        .lock()
+        .expect("nodename regex cache poisoned");
+    let compiled = cache
+        .entry(pattern.to_string())
+        .or_insert_with(|| regex::Regex::new(pattern).ok());
+    match compiled {
+        Some(regex) => regex.is_match(name),
+        None => split_patterns(pattern)
+            .iter()
+            .any(|alt| alternative_matches(alt, name)),
+    }
 }
 
 fn alternative_matches(pattern: &str, name: &str) -> bool {
