@@ -107,6 +107,12 @@ pub struct CompletionSchema {
     /// `oneOf`/`anyOf` pure-required disjunctions — the validator
     /// flags a governed node satisfying NONE of the branches.
     pub requirement_alternations: Vec<RequirementAlternation>,
+    /// `dependencies:` pairs (JSON-schema's dependentRequired): the
+    /// PRESENCE of the first property demands each dependent name
+    /// (gpio-charger: charge-current-limit-gpios ⇒
+    /// charge-current-limit-mapping). Dict-shaped values are
+    /// dependentSchemas — out of scope, skipped.
+    pub dependencies: Vec<(String, Vec<String>)>,
     /// The binding's `properties.$nodename` name constraint (pattern-
     /// or const-form) — a governed node's NAME must match, judged by
     /// the LENIENT literal-run matcher (fewer violations, never a
@@ -224,6 +230,12 @@ impl Bindings {
             .iter()
             .map(|s| s.requirement_alternations.len())
             .sum()
+    }
+
+    /// Every parsed `dependencies:` pair (dependentRequired) — audit
+    /// metric (63 kernel bindings carry one).
+    pub fn dependency_count(&self) -> usize {
+        self.schemas.iter().map(|s| s.dependencies.len()).sum()
     }
 
     /// Whether any binding data was indexed — completion hints and
@@ -392,6 +404,7 @@ impl Bindings {
         }
         let mut conditionals = Vec::new();
         let mut alternations = Vec::new();
+        let mut dependencies = Vec::new();
         let mut nodename = None;
         let properties = {
             let mut merged: BTreeMap<String, PropertyHint> = BTreeMap::new();
@@ -409,6 +422,7 @@ impl Bindings {
                 }
                 collect_conditionals(&view, &mut conditionals);
                 collect_requirement_alternations(&view, &mut alternations);
+                collect_dependencies(&view, &mut dependencies);
             }
             merged
         };
@@ -426,6 +440,7 @@ impl Bindings {
             alternatives,
             conditionals,
             requirement_alternations: alternations,
+            dependencies,
             nodename,
             enums: keys,
         });
@@ -777,6 +792,34 @@ fn collect_item_position(item: &Value, consts: &mut Vec<String>, enums: &mut Vec
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Extract the `dependencies:` pairs of one flat view —
+/// JSON-schema's dependentRequired: a node carrying the FIRST name
+/// must also carry each of the dependent names (gpio-charger's
+/// charge-current-limit-gpios ⇒ charge-current-limit-mapping).
+/// Dict-shaped values are dependentSchemas (a nested constraint
+/// object — 3 occurrences corpus-wide) and stay out of scope.
+fn collect_dependencies(view: &Value, out: &mut Vec<(String, Vec<String>)>) {
+    let Some(Value::Mapping(pairs)) = view.get("dependencies") else {
+        return;
+    };
+    for (trigger, needed) in pairs.iter() {
+        let Some(trigger) = trigger.as_str() else {
+            continue;
+        };
+        let Value::Sequence(names) = needed else {
+            continue; // dependentSchemas shape — skipped
+        };
+        let deps: Vec<String> = names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if !deps.is_empty() {
+            out.push((trigger.to_string(), deps));
         }
     }
 }

@@ -27,6 +27,9 @@ use std::path::Path;
 ///   whose branches the node satisfies (neither `interrupts` nor
 ///   `interrupts-extended`) — Warning, anchored at the `compatible`,
 ///   at-least-one semantics: carrying several branches stays silent.
+/// - dependent-required: a present trigger property calls for its
+///   dependent names (gpio-charger's gpios family) — Warning, no
+///   trigger, no judgement.
 /// - deprecated-use: DEFERRED to a policy round — stock in-tree dtsi
 ///   legitimately carries deprecated idioms.
 pub fn binding_diagnostics(
@@ -178,6 +181,32 @@ fn check_node(
                     ErrorCode::CustomWarning,
                     format!(
                         "node name `{name}` does not match `{pattern}` — binding `{binding}`"
+                    ),
+                ));
+            }
+        }
+        // dependentRequired: PRESENCE of the trigger property calls
+        // for each dependent name (gpio-charger's
+        // charge-current-limit-gpios ⇒ charge-current-limit-mapping) —
+        // no trigger, no judgement — along the property-or-child duality
+        for (trigger, needed) in &schema.dependencies {
+            if !(node.get_property(trigger).is_some() || node.child_exists(trigger)) {
+                continue;
+            }
+            for name in needed {
+                if fired.contains(name)
+                    || node.get_property(name).is_some()
+                    || node.child_exists(name)
+                {
+                    continue;
+                }
+                fired.push(name.clone());
+                out.push(Diagnostic::new(
+                    identity.name.span(),
+                    identity.end.source(),
+                    ErrorCode::CustomWarning,
+                    format!(
+                        "binding `{binding}` requires property `{name}` alongside `{trigger}`"
                     ),
                 ));
             }
@@ -1091,5 +1120,61 @@ required:
         assert!(diags[0].message.contains(
             "node name `wrongnode@1` does not match `^([a-z][a-z0-9\\-]+-bus|bus|soc)(@.+)?$` — binding `vendor,buses`"
         ));
+    }
+
+    #[test]
+    pub fn dependent_required_fires_alongside_present_triggers() {
+        // `dependencies:` (JSON-schema's dependentRequired): PRESENCE of
+        // the trigger property demands each dependent name — no trigger,
+        // no judgement — along the property-or-child duality; the
+        // gpio-charger gpios family is the real-corpus idiom
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,dep.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,dep
+  trigger-prop:
+    description: calls for its dependent
+  needed-prop:
+    description: the dependent itself
+  node-trigger:
+    description: a trigger satisfied the usual way
+  node-need:
+    description: a dependent satisfiable as a child node
+required:
+  - compatible
+dependencies:
+  trigger-prop:
+    - needed-prop
+  node-trigger:
+    - node-need
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tdep-ok {\n\t\tcompatible = \"vendor,dep\";\n\t\ttrigger-prop = <1>;\n\t\tneeded-prop = <1>;\n\t};\n",
+            "\tdep-fire {\n\t\tcompatible = \"vendor,dep\";\n\t\ttrigger-prop = <1>;\n\t};\n",
+            "\tdep-unttrigger {\n\t\tcompatible = \"vendor,dep\";\n\t\tneeded-prop = <1>;\n\t};\n",
+            "\tdep-duality {\n\t\tcompatible = \"vendor,dep\";\n\t\tnode-trigger = <1>;\n\t\tnode-need {\n\t\t};\n\t};\n",
+            "\tdep-duality-fire {\n\t\tcompatible = \"vendor,dep\";\n\t\tnode-trigger = <1>;\n\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(diags.len(), 2, "{:#?}", diags);
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains(
+                "binding `vendor,dep` requires property `needed-prop` alongside `trigger-prop`"
+            )));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains(
+                "binding `vendor,dep` requires property `node-need` alongside `node-trigger`"
+            )));
     }
 }
