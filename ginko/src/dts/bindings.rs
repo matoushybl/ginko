@@ -224,7 +224,24 @@ pub struct Bindings {
     /// bondless HINT consults this alone: a string documented in child
     /// position is corpus-governed, so a node citing it is not typeless.
     documented: BTreeSet<String>,
+    /// compatible string -> number of binding-EXAMPLE assignments seen
+    /// while indexing — the corpus maintainers' own usage signal, the
+    /// basis of the staged common-compatibles tier.
+    example_counts: HashMap<String, u32>,
+    /// The canonical universal tier: documented strings used in at
+    /// least `COMMON_COMPATIBLE_MIN_USES` example assignments, ordered
+    /// by (count desc, lexical) — served for compatible VALUES when a
+    /// node has no binding-derived candidates and little is typed yet.
+    common_compatibles: Vec<String>,
 }
+
+/// A compatible string joins the canonical tier after this many
+/// binding-example assignments — census on the Unipi kernel corpus:
+/// at 8 uses the tier is ~34 strings (syscon, simple-mfd, simple-bus,
+/// fixed-clock, arm,primecell, usb-c-connector, ...), and the
+/// frequency curve flattens fast (6+ selects 47, 5+ selects 71,
+/// 4+ selects 120).
+const COMMON_COMPATIBLE_MIN_USES: u32 = 8;
 
 impl Bindings {
     /// Build an index from binding roots, e.g. a kernel checkout's
@@ -242,7 +259,36 @@ impl Bindings {
         for file in files {
             bindings.add_file(&file);
         }
+        bindings.finalize_common_compatibles();
         bindings
+    }
+
+    /// Distill the canonical tier from the example census — called once,
+    /// after indexing completes: a string earns a slot only when the
+    /// corpus itself documents it AND its examples used it at least
+    /// `COMMON_COMPATIBLE_MIN_USES` times. Deterministic order (count
+    /// descending, then lexical) — batteries pin it.
+    fn finalize_common_compatibles(&mut self) {
+        let mut counted: Vec<(&String, u32)> = self
+            .example_counts
+            .iter()
+            .filter(|(string, uses)| {
+                **uses >= COMMON_COMPATIBLE_MIN_USES && self.documented.contains(*string)
+            })
+            .map(|(string, uses)| (string, *uses))
+            .collect();
+        counted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        self.common_compatibles = counted
+            .into_iter()
+            .map(|(string, _)| string.clone())
+            .collect();
+    }
+
+    /// The canonical universal tier for compatible-value completion on
+    /// candidate-less nodes: example-frequent documented strings in
+    /// (count desc, lexical) order.
+    pub fn common_compatibles(&self) -> &[String] {
+        &self.common_compatibles
     }
 
     pub fn schema_count(&self) -> usize {
@@ -490,6 +536,11 @@ impl Bindings {
         let Ok(binding) = serde_yaml::from_str::<Value>(&text) else {
             return;
         };
+        {
+            let mut example_counts = std::mem::take(&mut self.example_counts);
+            count_example_compatibles(&binding, &mut example_counts);
+            self.example_counts = example_counts;
+        }
         self.add_schema(path.to_path_buf(), &binding);
     }
 
@@ -1996,6 +2047,94 @@ fn scalar_string(value: &Value) -> Option<String> {
     }
 }
 
+/// `compatible = "a", "b";` statements — a complete DTS assignment inside
+/// a binding-example block; group 1 holds the quoted string list.
+static EXAMPLE_COMPATIBLE_ASSIGNMENT: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"compatible\s*=\s*((?:"[^"]+"\s*,?\s*)+);"#)
+            .expect("compatible assignment pattern compiles")
+    });
+
+/// One quoted string inside an assignment's value list.
+static EXAMPLE_QUOTED_STRING: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#""([^"]+)""#).expect("quoted string pattern compiles")
+    });
+
+/// Count compatible assignments inside a binding's `examples:` DTS blocks —
+/// the popularity signal for the staged common-compatibles tier (the
+/// corpus maintainers' own usage). Only COMPLETE assignments (ending in
+/// `;`) count and only quoted strings do; `#`-prefixed dt-include defines
+/// are skipped — they are not compatible strings.
+fn count_example_compatibles(binding: &Value, out: &mut HashMap<String, u32>) {
+    let Some(Value::Sequence(examples)) = binding.get("examples") else {
+        return;
+    };
+    for example in examples {
+        let Some(text) = scalar_string(example) else {
+            continue;
+        };
+        for assignment in EXAMPLE_COMPATIBLE_ASSIGNMENT.captures_iter(&text) {
+            let Some(list) = assignment.get(1) else {
+                continue;
+            };
+            for string in EXAMPLE_QUOTED_STRING.captures_iter(list.as_str()) {
+                let Some(candidate) = string.get(1) else {
+                    continue;
+                };
+                let candidate = candidate.as_str();
+                if candidate.is_empty() || candidate.starts_with('#') {
+                    continue;
+                }
+                *out.entry(candidate.to_string()).or_default() += 1;
+            }
+        }
+    }
+}
+
+/// Is `needle` a subsequence of `haystack` (order-preserving, gaps
+/// allowed)? The loose tier of [`fuzzy_compatibles`].
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut needle = needle.chars();
+    let Some(mut expected) = needle.next() else {
+        return true;
+    };
+    for ch in haystack.chars() {
+        if ch == expected {
+            match needle.next() {
+                Some(next) => expected = next,
+                None => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Fuzzy search over the WHOLE documented compatible pool — the second
+/// stage of the common-compatibles completion, serving any prefix once at
+/// least two characters are typed. Deterministic ranking so batteries
+/// pin it: contiguous-substring matches outrank loose subsequence
+/// matches, and within a rank (length ascending, lexical) decides; the
+/// result is capped AFTER ranking. Case-sensitive: compatible strings
+/// are lowercase by convention, no silent case-folding surprises.
+pub fn fuzzy_compatibles(bindings: &Bindings, prefix: &str, cap: usize) -> Vec<String> {
+    let mut substring: Vec<String> = Vec::new();
+    let mut subsequence: Vec<String> = Vec::new();
+    for candidate in &bindings.documented {
+        if candidate.contains(prefix) {
+            substring.push(candidate.clone());
+        } else if is_subsequence(prefix, candidate) {
+            subsequence.push(candidate.clone());
+        }
+    }
+    let rank = |rank: &mut Vec<String>| rank.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    rank(&mut substring);
+    rank(&mut subsequence);
+    substring.extend(subsequence);
+    substring.truncate(cap);
+    substring
+}
+
 /// Recursively collect `*.yaml` files below `path`. A file passed directly is
 /// accepted; anything unreadable contributes nothing.
 fn collect_yaml_files(path: &Path, out: &mut Vec<PathBuf>) {
@@ -3270,5 +3409,153 @@ properties:
 
         assert_eq!(bindings.schema_count(), 2);
         assert_eq!(bindings.compatible_count(), 2);
+    }
+
+    #[test]
+    pub fn example_census_counts_complete_assignments_only() {
+        let binding: Value = serde_yaml::from_str(
+            r##"
+examples:
+  - |
+    /dts-v1/;
+    / {
+        demo@d000 {
+            compatible = "vendor,demo";
+            friend = "vendor,friends";
+        };
+        pairing@1 {
+            compatible = "vendor,pair-first", "vendor,pair-second";
+        };
+        incomplete@d000 {
+            compatible = "vendor,dropped"
+        };
+        guarded@d000 {
+            compatible = "#include-dt-bindings";
+        };
+        notcompatible@1 {
+            other = "vendor,other";
+        };
+    };
+"##,
+        )
+        .unwrap();
+        let mut counts = HashMap::new();
+        count_example_compatibles(&binding, &mut counts);
+        assert_eq!(counts.get("vendor,demo"), Some(&1));
+        assert_eq!(counts.get("vendor,pair-first"), Some(&1));
+        assert_eq!(counts.get("vendor,pair-second"), Some(&1));
+        // no trailing `;` — not a complete assignment
+        assert!(counts.get("vendor,dropped").is_none());
+        // dt-include defines are not compatible strings
+        assert!(counts.get("#include-dt-bindings").is_none());
+        // only `compatible` assignments count
+        assert!(counts.get("vendor,other").is_none());
+        assert_eq!(counts.len(), 3);
+    }
+
+    #[test]
+    pub fn common_compatible_tier_is_thresholded_documented_gated_and_ordered() {
+        // syscon: documented + used >= COMMON_COMPATIBLE_MIN_USES times -> in
+        let mut syscon_yaml =
+            String::from("properties:\n  compatible:\n    const: syscon\nexamples:\n  - |\n");
+        for _ in 0..COMMON_COMPATIBLE_MIN_USES {
+            syscon_yaml.push_str("    d { compatible = \"syscon\"; };\n");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("syscon.yaml"), syscon_yaml).unwrap();
+        // zarro: documented + counted but BELOW the threshold -> out
+        fs::write(
+            dir.path().join("zarro.yaml"),
+            r#"
+properties:
+  compatible:
+    const: zarro
+examples:
+  - |
+    z1 { compatible = "zarro"; };
+    z2 { compatible = "zarro"; };
+"#,
+        )
+        .unwrap();
+        // example-popular but UNDOCUMENTED anywhere -> out (documented gate)
+        fs::write(
+            dir.path().join("noprops.yaml"),
+            r#"
+description: common-part schema, documents nothing
+examples:
+  - |
+    n1 { compatible = "never-documented"; };
+    n2 { compatible = "never-documented"; };
+    n3 { compatible = "never-documented"; };
+    n4 { compatible = "never-documented"; };
+    n5 { compatible = "never-documented"; };
+    n6 { compatible = "never-documented"; };
+    n7 { compatible = "never-documented"; };
+    n8 { compatible = "never-documented"; };
+    n9 { compatible = "never-documented"; };
+"#,
+        )
+        .unwrap();
+        // a documented TIE at the threshold: same use count as syscon,
+        // participates with count-desc order breaking by lexical order
+        let mut simple_bus_yaml = String::from(
+            "properties:\n  compatible:\n    const: simple-bus\nexamples:\n  - |\n",
+        );
+        for _ in 0..COMMON_COMPATIBLE_MIN_USES {
+            simple_bus_yaml.push_str("    d { compatible = \"simple-bus\"; };\n");
+        }
+        fs::write(dir.path().join("simple-bus.yaml"), simple_bus_yaml).unwrap();
+
+        // equal counts -> lexical tiebreak decides; everything else is out
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let tier: Vec<&str> = bindings
+            .common_compatibles()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // equal counts -> lexical tiebreak decides; everything else is out
+        assert_eq!(tier, vec!["simple-bus", "syscon"]);
+    }
+
+    #[test]
+    pub fn fuzzy_compatibles_rank_substrings_first_then_subsequences() {
+        let mut bindings = Bindings::default();
+        bindings.documented = [
+            "fsl,imx8mm",
+            "imx",
+            "im",
+            "arm,primecell",
+            "silent",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        // substring hits win, ordered (length asc, lexical); subsequence
+        // hits follow in their own (length asc, lexical) order; "silent"
+        // matches neither ("im": no m after its i)
+        let ranked = fuzzy_compatibles(&bindings, "im", 50);
+        assert_eq!(
+            ranked,
+            vec![
+                "im".to_string(),
+                "imx".to_string(),
+                "fsl,imx8mm".to_string(),
+                "arm,primecell".to_string(),
+            ]
+        );
+
+        // the cap trims AFTER ranking — the substring tier survives it
+        let capped = fuzzy_compatibles(&bindings, "im", 2);
+        assert_eq!(capped, vec!["im".to_string(), "imx".to_string()]);
+
+        // no match at all -> empty (the pool must never serve noise)
+        assert!(fuzzy_compatibles(&bindings, "zz", 50).is_empty());
+
+        // subsequence order-preservation: 'q' only AFTER an 'i' matches
+        assert!(is_subsequence("iq", "quiet-iq"));
+        assert!(!is_subsequence("iq", "quieter-arm"));
+        // empty prefix is a subsequence of everything (server gates this)
+        assert!(is_subsequence("", "anything"));
     }
 }

@@ -1,8 +1,9 @@
 use ginko::dts::{
     AnyDirective, Bindings, CompletionContext, FileType, HasSpan, IncludeLoader,
     IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload,
-    ParserConfig, Primary, Project, ResolvedContext, ResolvedNode, ResolvedProperty, Severity,
-    SeverityMap, Span, binding_diagnostics, merge_hint, node_compatibles,
+    ParserConfig, Primary, Project, PropertyValue, ResolvedContext, ResolvedNode,
+    ResolvedProperty, Severity, SeverityMap, Span, binding_diagnostics, fuzzy_compatibles,
+    merge_hint, node_compatibles,
 };
 use ginko::header::{Define, TokenKind, parse_header};
 use itertools::Itertools;
@@ -104,7 +105,7 @@ impl Backend {
         let paths: Vec<PathBuf> = binding_paths.iter().map(PathBuf::from).collect();
         self.bindings = Bindings::from_paths(&paths);
         tracing::info!(
-            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas, {} conditionals, {} disjunctions, {} dependencies, {} documented strings",
+            "bindings: indexed {} schemas over {} compatible strings, {} common properties, {} child schemas, {} conditionals, {} disjunctions, {} dependencies, {} documented strings, {} common compatibles",
             self.bindings.schema_count(),
             self.bindings.compatible_count(),
             self.bindings.common_prop_count(),
@@ -112,7 +113,8 @@ impl Backend {
             self.bindings.conditional_count(),
             self.bindings.disjunction_count(),
             self.bindings.dependency_count(),
-            self.bindings.documented_count()
+            self.bindings.documented_count(),
+            self.bindings.common_compatibles().len()
         );
         self
     }
@@ -879,7 +881,84 @@ impl LanguageServer for Backend {
                     });
                 }
             }
+            // STAGED COMMON-COMPATIBLES — the unbound compatible-value hole:
+            // every pool above is binding-keyed, so a value position inside a
+            // node NO binding accepts served nothing useful (the r12 mbus pin
+            // — the classic fallback degenerated to dtschema's two
+            // ethernet-phy constants). The corpus itself takes over when no
+            // binding accepts the node, in two stages: with little typed,
+            // the canonical tier of example-frequent documented strings
+            // (merged with the common-value constants); once at least two
+            // characters exist, fuzzy search over EVERY documented string —
+            // 20k subsequence probes cost ~1-2ms and the capped list stays
+            // small. Governing bindings always win: matched/child hints
+            // gate this branch off.
+            if name == "compatible" && matched.is_none() && child_hint.is_none() {
+                let typed = value_prefix_at(project, file_path, pos, property).unwrap_or_default();
+                let fuzzed = typed.chars().count() >= 2;
+                let candidates: Vec<String> = if fuzzed {
+                    fuzzy_compatibles(bindings, &typed, 50)
+                } else {
+                    let mut tier = bindings.common_compatibles().to_vec();
+                    for extra in bindings.common_values(name) {
+                        if !tier.iter().any(|tierred| tierred == extra) {
+                            tier.push(extra.clone());
+                        }
+                    }
+                    tier
+                };
+                if !candidates.is_empty() {
+                    let detail = if fuzzed {
+                        "documented compatible"
+                    } else {
+                        "common compatible"
+                    };
+                    items.clear();
+                    for label in candidates {
+                        items.push(CompletionItem {
+                            label,
+                            detail: Some(detail.to_string()),
+                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
             (!items.is_empty()).then_some(CompletionResponse::Array(items))
+        }
+
+        /// The text typed into the property's string value under the
+        /// cursor — the content since that value's opening quote.
+        /// `compatible = "im<cursor>"` yields `im`, `compatible =
+        /// "<cursor>"` yields the empty prefix. Serves the staged
+        /// common-compatibles pool; None when the cursor sits in no
+        /// string value of the property.
+        fn value_prefix_at(
+            project: &Project,
+            file_path: &Path,
+            pos: &ginko::dts::Position,
+            property: &ResolvedProperty,
+        ) -> Option<String> {
+            for value in property.property().values.iter() {
+                let PropertyValue::String(string) = value else {
+                    continue;
+                };
+                let span = string.span();
+                if !span.contains(pos) {
+                    continue;
+                }
+                let file = project.get_file(file_path)?;
+                let line = file.source().lines().nth(pos.line() as usize)?;
+                let start = span.start().character() as usize + 1;
+                let end = pos.character() as usize;
+                let prefix: String = line
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .collect();
+                return Some(prefix.trim_matches('"').to_string());
+            }
+            None
         }
 
         /// The DTS spelling of a binding-relative header path: strip the

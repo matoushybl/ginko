@@ -17,8 +17,10 @@ mod tokens;
 mod validate;
 mod visitor;
 
-pub use ast::{AnyDirective, Node, NodeItem, NodePayload, Primary};
-pub use bindings::{Bindings, CompletionSchema, PropertyHint, merge_hint, node_compatibles};
+pub use ast::{AnyDirective, Node, NodeItem, NodePayload, Primary, PropertyValue};
+pub use bindings::{
+    Bindings, CompletionSchema, PropertyHint, fuzzy_compatibles, merge_hint, node_compatibles,
+};
 pub use validate::binding_diagnostics;
 pub use data::{FileType, HasSource, HasSpan, Position, Span};
 pub use diagnostics::{Diagnostic, DiagnosticPrinter, Severity};
