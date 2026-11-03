@@ -584,6 +584,14 @@ where
     pub fn last_pos(&self) -> Position {
         self.lexer.last_pos
     }
+
+    /// The reader's current position. After a `peek()` that returned `None`
+    /// (end of input) the reader has already skipped trailing whitespace,
+    /// so this is the true end-of-input position — unlike `last_pos()`,
+    /// which is only the end of the last consumed token.
+    pub fn pos(&self) -> Position {
+        self.lexer.pos()
+    }
 }
 
 impl<R> Iterator for PeekingLexer<R>

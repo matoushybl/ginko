@@ -535,6 +535,16 @@ impl Project {
             return Some(token);
         }
 
+        // Empty lines have no chars to iterate, so the loop below falls
+        // through to `None` — which made the completion handler dead-end
+        // at INTERIOR BLANK LINES: the one place a node body refused to
+        // complete even on fully-parsed files. LSP allows a `character`
+        // beyond the (zero) line length: clamp to the empty token, the
+        // same result as a cursor at the line's start.
+        if line.is_empty() {
+            return Some(String::new());
+        }
+
         for (i, c) in line.chars().enumerate() {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '?' || c == '&'
             {
@@ -1429,7 +1439,7 @@ mod tests {
     pub fn token_at_handles_column_zero_and_boundaries() {
         let mut project = Project::default();
         let mut loader = IncludeLoaderGuard::default();
-        let text = "/dts-v1/;\n/ {\n\treg@1000 {\n\t\tcompatible = \"vendor,device\";\n\t};\n};\n";
+        let text = "/dts-v1/;\n/ {\n\treg@1000 {\n\t\tcompatible = \"vendor,device\";\n\n\t\treg = <1>;\n\t};\n};\n";
         let temp_dir = TempDir::new();
         let (_, path) = temp_dir.add_file("test.dts", text);
         project
@@ -1462,6 +1472,17 @@ mod tests {
             ),
             None
         );
+        // interior blank line (post-compatible): every column clamps to
+        // the empty token — positions beyond a zero-length line used to
+        // fall through to `None` and kill the whole completion machinery
+        assert_eq!(
+            project.token_at(&path, &crate::dts::Position::new(4, 0)),
+            Some(String::new())
+        );
+        assert_eq!(
+            project.token_at(&path, &crate::dts::Position::new(4, 2)),
+            Some(String::new())
+        );
     }
 
     #[test]
@@ -1486,6 +1507,110 @@ mod tests {
             .context_at(&path, &pos)
             .expect("reference visitor must find the enclosing node for blank positions");
         assert!(matches!(ref_ctx, crate::dts::ResolvedContext::Node(_)));
+    }
+
+    #[test]
+    pub fn half_open_node_at_eof_keeps_positions_resolvable() {
+        // the reported UX defect: typing `name {` used to kill completion
+        // for the WHOLE file — the parse died on the hard `?` and the
+        // tree vanished. Recovery keeps the file resolvable.
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let text = "/dts-v1/;\n\n/ {\n\tleds {\n\t\tcompatible = \"gpio-leds\";\n\t\ted-status {\n\t\t\tday\n\t\t\t";
+        let temp_dir = TempDir::new();
+        let (_, path) = temp_dir.add_file("test.dts", text);
+        project
+            .add_file(path.display().to_string(), &mut loader)
+            .expect("Cannot add file");
+
+        // the blank tail inside the still-open node (last line of the text)
+        let lines: Vec<&str> = text.split('\n').collect();
+        let i_tail = (lines.len() - 1) as u32;
+        let pos = crate::dts::Position::new(i_tail, 3);
+        let ctx = project
+            .completion_context_at(&path, &pos)
+            .expect("half-open payload tail must resolve to a context");
+        assert!(
+            matches!(ctx, crate::dts::CompletionContext::InNode(_)),
+            "open node tail must resolve to its node body"
+        );
+    }
+
+    #[test]
+    pub fn unterminated_cells_with_brace_tail_keep_positions_resolvable() {
+        // `gpios = <&gpi` + the file's structural closers below: the old
+        // loop ate the closers as cell junk and destroyed the tree
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let text = "/dts-v1/;\n\n/ {\n\ttestleds {\n\t\tcompatible = \"gpio-leds\";\n\t\tled-status {\n\t\t\tgpios = <&gpi\n\t\t\t\n\t\t};\n\t};\n};\n";
+        let temp_dir = TempDir::new();
+        let (_, path) = temp_dir.add_file("test.dts", text);
+        project
+            .add_file(path.display().to_string(), &mut loader)
+            .expect("Cannot add file");
+
+        // positions are derived from the text — hand-counted line numbers
+        // have drifted twice this round; the anchor lookup owns the truth
+        let lines: Vec<&str> = text.split('\n').collect();
+        let i_gpios = lines
+            .iter()
+            .position(|l| l.contains("gpios = <"))
+            .expect("fixture must contain the gpios line") as u32;
+        let i_blank = i_gpios + 1;
+        let eol_col = lines[i_gpios as usize].len() as u32;
+
+        // the blank line below the unterminated cells belongs to the node
+        // body — the VALUE recovery must not swallow it
+        let pos = crate::dts::Position::new(i_blank, 2);
+        let ctx = project
+            .completion_context_at(&path, &pos)
+            .expect("must stay resolvable while a cell list is half-typed");
+        assert!(
+            matches!(ctx, crate::dts::CompletionContext::InNode(_)),
+            "blank lines below a recovered cell list must resolve to the node body"
+        );
+
+        // the END of the value line itself (cursor typing one more cell)
+        // must stay INSIDE the property — label/prefix completion while
+        // typing the value is the whole point of the value-line anchor
+        let eol = crate::dts::Position::new(i_gpios, eol_col);
+        let ctx = project
+            .completion_context_at(&path, &eol)
+            .expect("value line stays resolvable mid-typing");
+        assert!(
+            matches!(ctx, crate::dts::CompletionContext::InProperty(..)),
+            "the recovered value must own the rest of its own line"
+        );
+    }
+
+    #[test]
+    pub fn junk_token_inside_payload_skips_instead_of_killing_the_file() {
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let text = "/dts-v1/;\n\n/ {\n\tx {\n\t\t~\n\t\tone;\n\t\n\t};\n};\n";
+        let temp_dir = TempDir::new();
+        let (_, path) = temp_dir.add_file("test.dts", text);
+        project
+            .add_file(path.display().to_string(), &mut loader)
+            .expect("Cannot add file");
+
+        // blank line (6) inside `x`, after the skipped stray token —
+        // derived from the stray-token anchor, never hand-counted
+        let lines: Vec<&str> = text.split('\n').collect();
+        let i_stray = lines
+            .iter()
+            .position(|l| l.contains("one;"))
+            .expect("fixture must contain the post-stray property") as u32;
+        // the blank line right after it is the interior tail of `x`
+        let i_blank = i_stray + 1;
+        let pos = crate::dts::Position::new(i_blank, 1);
+        let ctx = project
+            .completion_context_at(&path, &pos)
+            .expect("a stray token must not orphan the enclosing node");
+        assert!(
+            matches!(ctx, crate::dts::CompletionContext::InNode(_)),
+            "expected an InNode context after a skipped stray token"
+        );
     }
 
     #[test]

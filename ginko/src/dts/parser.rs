@@ -423,12 +423,44 @@ where
             }
             TokenKind::ChevronLeft => {
                 let mut cells: Vec<Cell> = vec![];
-                let end_tok: Token;
+                let end_tok;
                 loop {
                     self.skip_optional_label();
-                    if self.lexer.peek_expect()?.kind == TokenKind::ChevronRight {
-                        end_tok = self.lexer.expect_next()?;
+                    let Some(peeked) = self.lexer.peek() else {
+                        // EOF mid-cells — a half-typed `<&ref` tail.
+                        // Diagnose and close instead of the old `?`
+                        // that abandoned the whole file
+                        self.diagnostics.push(Diagnostic::expected(
+                            self.lexer.last_pos().as_span(),
+                            self.lexer.source(),
+                            &[TokenKind::ChevronRight],
+                        ));
+                        end_tok = self.recovered_value_end(TokenKind::ChevronRight);
                         break;
+                    };
+                    match &peeked.kind {
+                        TokenKind::ChevronRight => {
+                            end_tok = self.lexer.expect_next()?;
+                            break;
+                        }
+                        TokenKind::Semicolon | TokenKind::CloseBrace => {
+                            // `;` and `}` can never be cell content — the
+                            // user typed an unterminated list and the
+                            // file's structural tokens follow. Recover
+                            // WITHOUT consuming: the property tail and
+                            // node closure flow into expect_semicolon's
+                            // tolerant path, and the rest of the file
+                            // parses (the old loop ate the closers as
+                            // cell junk and killed the whole tree)
+                            self.diagnostics.push(Diagnostic::expected(
+                                peeked.span(),
+                                peeked.source(),
+                                &[TokenKind::ChevronRight],
+                            ));
+                            end_tok = self.recovered_value_end(TokenKind::ChevronRight);
+                            break;
+                        }
+                        _ => {}
                     }
 
                     match self.number_u32() {
@@ -443,16 +475,48 @@ where
             )),
             TokenKind::OpenBracket => {
                 let mut byte_strings: Vec<WithToken<Vec<u8>>> = vec![];
-                let end: Token;
+                let end;
                 loop {
                     self.skip_optional_label();
-                    let tok = self.lexer.peek_expect()?;
-                    if tok.kind == TokenKind::CloseBracket {
-                        end = tok.clone();
+                    let Some(peeked) = self.lexer.peek() else {
+                        // EOF mid-bytestring — same recovery as cells
+                        self.diagnostics.push(Diagnostic::expected(
+                            self.lexer.last_pos().as_span(),
+                            self.lexer.source(),
+                            &[TokenKind::CloseBracket],
+                        ));
+                        end = self.recovered_value_end(TokenKind::CloseBracket);
+                        break;
+                    };
+                    if peeked.kind == TokenKind::CloseBracket {
+                        end = peeked.clone();
                         self.skip_tok();
                         break;
                     }
-                    byte_strings.push(self.byte_string()?);
+                    if matches!(peeked.kind, TokenKind::Semicolon | TokenKind::CloseBrace) {
+                        // structural recovery — never legal byte content
+                        self.diagnostics.push(Diagnostic::expected(
+                            peeked.span(),
+                            peeked.source(),
+                            &[TokenKind::CloseBracket],
+                        ));
+                        end = self.recovered_value_end(TokenKind::CloseBracket);
+                        break;
+                    }
+                    // a half-typed (or junk) element: diagnosed in place;
+                    // the old `?` dropped the whole file on any element
+                    // error
+                    match self.byte_string() {
+                        Ok(bytes) => byte_strings.push(bytes),
+                        Err(err) => {
+                            self.diagnostics.push(err);
+                            // the loop breaks mid-value: anchor the end at
+                            // the last real token so the property span still
+                            // covers earlier elements
+                            end = self.recovered_value_end(TokenKind::CloseBracket);
+                            break;
+                        }
+                    }
                 }
                 Ok(PropertyValue::ByteStrings(tok, byte_strings, end))
             }
@@ -520,7 +584,13 @@ where
             self.skip_optional_label();
             values.push(self.property_value()?);
             self.skip_optional_label();
-            if self.lexer.peek_expect()?.kind == TokenKind::Comma {
+            // EOF right after a value (half-typed tail): the value is
+            // complete and expect_semicolon reports the missing `;` —
+            // never re-kill the parse here
+            let Some(peeked) = self.lexer.peek() else {
+                break;
+            };
+            if peeked.kind == TokenKind::Comma {
                 self.skip_tok();
             } else {
                 break;
@@ -588,6 +658,20 @@ where
 
         let mut node_discovered = false;
         loop {
+            // EOF mid-payload: a half-typed `name {` still owns a USABLE
+            // tree — everything above parses, the open node keeps its
+            // payload items, and an expected-`}` diagnostic marks the
+            // missing close. The old hard `?` abandoned the WHOLE file,
+            // killing completion everywhere until the braces landed
+            if self.lexer.peek().is_none() {
+                self.diagnostics.push(Diagnostic::expected(
+                    self.lexer.last_pos().as_span(),
+                    self.lexer.source(),
+                    &[TokenKind::CloseBrace],
+                ));
+                end = self.recovered_node_end();
+                break;
+            }
             let tok = self.lexer.expect_next()?;
             if matches!(&tok.kind, TokenKind::Ident(w) if Self::is_cpp_directive(w)) {
                 self.skip_cpp_directive_line(&tok)?;
@@ -619,15 +703,30 @@ where
                     break;
                 }
                 _ => {
-                    return Err(Diagnostic::expected(
+                    // stray token inside a payload: diagnose it and skip
+                    // one token per iteration (fresh head) instead of
+                    // dropping the whole file on the first junk char
+                    self.diagnostics.push(Diagnostic::expected(
                         tok.span(),
                         tok.source(),
                         &[TokenKind::Ident("".to_string()), TokenKind::CloseBrace],
                     ));
+                    continue;
                 }
             };
             let prev = tok;
-            let tok = self.lexer.peek_expect()?;
+            // after an item name: the `{`/`=` lookahead. EOF means the
+            // half-typed item sits at the file tail — diagnose and
+            // close the payload instead of abandoning the file
+            let Some(tok) = self.lexer.peek() else {
+                self.diagnostics.push(Diagnostic::expected(
+                    self.lexer.last_pos().as_span(),
+                    self.lexer.source(),
+                    &[TokenKind::OpenBrace, TokenKind::Equal],
+                ));
+                end = self.recovered_node_end();
+                break;
+            };
             let cloned_tok = tok.clone();
             match &tok.kind {
                 TokenKind::OpenBrace => {
@@ -649,7 +748,14 @@ where
                     self.skip_tok();
                     self.check_is_property_name(ident.span(), &ident);
                     let values = self.property_values()?;
-                    let end_tok = self.expect_semicolon()?.unwrap_or(cloned_tok);
+                    // missing `;` (`}`-recovery or EOF): end the property
+                    // where its last VALUE token ended, so the span still
+                    // covers the values (InProperty at the value line) —
+                    // falling back to the `=` token excluded the values and
+                    // starved value completions of their context
+                    let end_tok = self
+                        .expect_semicolon()?
+                        .unwrap_or_else(|| self.recovered_value_end(TokenKind::Semicolon));
                     if let Some(omit_if_no_ref) = omit_if_no_ref {
                         self.diagnostics.push(Diagnostic::new(
                             omit_if_no_ref.span,
@@ -711,6 +817,39 @@ where
             }
         }
         Ok(NodePayload { items, end })
+    }
+
+    /// Synthetic CloseBrace that closes a half-typed NODE payload at end
+    /// of input. All callers sit right after a `peek()` that hit EOF, so
+    /// the reader's position IS the true end of input (trailing whitespace
+    /// consumed): the open node keeps owning the blank tail the user is
+    /// typing into. The char-span width lets the half-open `Span::contains`
+    /// (`start <= pos < end`) still match a cursor sitting exactly at
+    /// end-of-input, the position editors report for a node typed one
+    /// keystroke ago (files without a trailing newline).
+    fn recovered_node_end(&self) -> Token {
+        Token {
+            kind: TokenKind::CloseBrace,
+            span: self.lexer.pos().as_char_span(),
+            source: self.lexer.source(),
+        }
+    }
+
+    /// Synthetic end token for a half-typed VALUE list (cells `<...`,
+    /// byte strings `[...`). Anchored at the END of the last real value
+    /// token, so the recovered list owns only the rest of its own line:
+    /// the cursor at that line's end still resolves inside the property
+    /// (label/prefix completion while typing the value), while blank
+    /// lines below fall back to the enclosing node body, where the user
+    /// is typing the NEXT item. Reusing the peeked `}` (or EOF) as the
+    /// end token instead swallows those blank lines into the value and
+    /// starves the node body of completions.
+    fn recovered_value_end(&self, kind: TokenKind) -> Token {
+        Token {
+            kind,
+            span: self.lexer.last_pos().as_char_span(),
+            source: self.lexer.source(),
+        }
     }
 
     /// Special function to expect a semicolon, but recover in common circumstances
