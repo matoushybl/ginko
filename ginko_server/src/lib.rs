@@ -585,11 +585,7 @@ impl LanguageServer for Backend {
                         CompletionItemKind::MODULE,
                     )
                 } else {
-                    let snippet = if hint.boolean {
-                        format!("{name};")
-                    } else {
-                        format!("{name} = $0;")
-                    };
+                    let snippet = property_value_snippet(&name, hint.boolean, hint.type_hint.as_deref());
                     let detail = if hint.required {
                         "required property".to_string()
                     } else {
@@ -635,11 +631,7 @@ impl LanguageServer for Backend {
                         CompletionItemKind::MODULE,
                     )
                 } else {
-                    let snippet = if hint.boolean {
-                        format!("{name};")
-                    } else {
-                        format!("{name} = $0;")
-                    };
+                    let snippet = property_value_snippet(name, hint.boolean, hint.type_hint.as_deref());
                     let detail = if hint.required {
                         "required property".to_string()
                     } else {
@@ -715,11 +707,19 @@ impl LanguageServer for Backend {
                     }
                     item.sort_text = Some("1".to_string());
                 } else {
+                    // string-family members insert the cursor INSIDE
+                    // quotes like the hint sites do
+                    let stub_hint = bindings
+                        .properties_for(&compatibles)
+                        .get(name.as_str())
+                        .cloned();
+                    let boolean = stub_hint.as_ref().is_some_and(|h| h.boolean);
+                    let type_hint = stub_hint.as_ref().and_then(|h| h.type_hint.as_deref());
                     items.push(CompletionItem {
                         label: name.clone(),
                         detail: Some("property".to_string()),
                         kind: Some(CompletionItemKind::FIELD),
-                        insert_text: Some(format!("{name} = $0;")),
+                        insert_text: Some(property_value_snippet(name, boolean, type_hint)),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         documentation: Some(Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -757,7 +757,9 @@ impl LanguageServer for Backend {
                         label: name.to_string(),
                         detail: Some("property".to_string()),
                         kind: Some(CompletionItemKind::FIELD),
-                        insert_text: Some(format!("{name} = $0;")),
+                        // the fallback pair is string typed by dt-spec:
+                        // the cursor lands INSIDE the quotes
+                        insert_text: Some(format!("{name} = \"$0\";")),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         ..Default::default()
                     });
@@ -1326,6 +1328,23 @@ impl LanguageServer for Backend {
             })
             .collect_vec();
         Ok(Some(DocumentSymbolResponse::Nested(nodes)))
+    }
+}
+
+/// The value-side snippet for property-NAME completions. Booleans stand
+/// alone (`name;`). STRING-family properties place the cursor INSIDE
+/// quotes — completing `compatible` inserts `compatible = "<cursor>";`,
+/// the shape the user asked for. Every other type (arrays, phandles,
+/// uints, unknown) keeps the raw `$0`: phandles/cells want `<...>` and
+/// quoting those would be a grammar error the user deletes afterwards.
+fn property_value_snippet<S: AsRef<str>>(name: S, boolean: bool, type_hint: Option<&str>) -> String {
+    let name = name.as_ref();
+    if boolean {
+        format!("{name};")
+    } else if matches!(type_hint, Some("string") | Some("string-array")) {
+        format!("{name} = \"$0\";")
+    } else {
+        format!("{name} = $0;")
     }
 }
 
