@@ -769,15 +769,31 @@ impl LanguageServer for Backend {
                         .map(|hint| &hint.values[..])
                 })
                 .unwrap_or_else(|| bindings.common_values(name));
-            let mut items: Vec<CompletionItem> = yaml_values
-                .iter()
-                .map(|value| CompletionItem {
-                    label: value.clone(),
-                    detail: Some(format!("{name} value")),
-                    kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    ..Default::default()
-                })
-                .collect();
+            let mut items: Vec<CompletionItem> = {
+                // deprecated VALUE spellings (the qcom,kpss-wdt branch
+                // class) — editors strike those candidates through (the
+                // completion twin of the validator's value Hint)
+                let deprecated_values: Vec<&String> = matched
+                    .map(|hint| hint.deprecated_values.iter())
+                    .into_iter()
+                    .flatten()
+                    .chain(
+                        child_hint
+                            .iter()
+                            .flat_map(|hint| hint.deprecated_values.iter()),
+                    )
+                    .collect();
+                yaml_values
+                    .iter()
+                    .map(|value| CompletionItem {
+                        label: value.clone(),
+                        detail: Some(format!("{name} value")),
+                        kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        deprecated: deprecated_values.contains(&value).then_some(true),
+                        ..Default::default()
+                    })
+                    .collect()
+            };
             let mut define_prefixes: BTreeMap<&str, &str> = BTreeMap::new();
             for hint in matched
                 .into_iter()

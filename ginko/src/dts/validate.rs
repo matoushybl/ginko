@@ -41,6 +41,10 @@ use std::path::Path;
 ///   never-documented strings (child-position compatibles are
 ///   corpus-governed per their parent's binding: job rings, snvs
 ///   children, idle states — upstream corpus debt, not user error).
+/// - deprecated-value: a nested `deprecated:` constraint marks an
+///   individual VALUE spelling (qcom,kpss-wdt's compatible branch) —
+///   Hint, at the value's own span, attributed to the accepted
+///   binding carrying the flag (the value twin of deprecated-use).
 pub fn binding_diagnostics(
     tree: &ResolvedTree,
     file: &Path,
@@ -334,6 +338,53 @@ fn check_node(
             ));
         }
     }
+    // deprecated VALUE spellings: a NESTED `deprecated:` constraint marks
+    // individual members (qcom-wdt's `qcom,kpss-wdt` compatible branch,
+    // the odroid audio consts, the allwinner sram enum branch) — surfaced
+    // as a Hint at the value's own span and attributed to the ACCEPTED
+    // binding that carries the flag (the value twin of the deprecated-use
+    // property check above). Covers every property INCLUDING `compatible`
+    // — deprecated spellings most often live there — while the loop above
+    // deliberately skips it (required/boolean/enum checks never apply)
+    for (name, property) in node.active_child_properties() {
+        let source = property.end.source();
+        if source.as_ref() != file {
+            // defined in the base or an overlay file — that file's pass
+            // reports it
+            continue;
+        }
+        let Some(hint) = hints.get(&name) else {
+            continue;
+        };
+        if hint.deprecated_values.is_empty() {
+            continue;
+        }
+        for value in &property.values {
+            let PropertyValue::String(string) = value else {
+                continue;
+            };
+            if !hint.deprecated_values.contains(string.item()) {
+                continue;
+            }
+            let deprecator = views.iter().find_map(|(binding, schema)| {
+                schema
+                    .properties
+                    .get(&name)
+                    .filter(|hint| hint.deprecated_values.contains(string.item()))
+                    .map(|_| binding.clone())
+            });
+            let attributed = match &deprecator {
+                Some(binding) => format!(" — binding `{binding}`"),
+                None => " by its binding".to_string(),
+            };
+            out.push(Diagnostic::new(
+                string.span(),
+                source.clone(),
+                ErrorCode::CustomHint,
+                format!("value `{}` is deprecated{attributed}", string.item()),
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +411,11 @@ properties:
       inner: true
   old-prop:
     deprecated: true
+  flavor-prop:
+    oneOf:
+      - enum: [ cherry, vanilla ]
+      - const: flavor-legacy
+        deprecated: true
   enum-prop:
     enum: [ alpha, beta ]
 required:
@@ -530,6 +586,45 @@ properties:
         let (project, _temp, paths) = open_project(&[("test.dts", text)]);
         let bindings = dev_bindings();
         assert!(diags_for(&project, &paths[0], &bindings).is_empty());
+    }
+
+    #[test]
+    pub fn deprecated_value_spellings_fire_at_the_value() {
+        // the qcom,kpss-wdt class: a NESTED `deprecated:` constraint marks
+        // an individual spelling (oneOf branch const here). The Hint
+        // anchors at the value's own span and attributes to the accepted
+        // binding; the property's plain enum members stay silent — and a
+        // wholly-deprecated property flags the NAME only, never doubling
+        // every spelling
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tdev@1 {\n",
+            "\t\tcompatible = \"vendor,dev\";\n",
+            "\t\treq-prop;\n",
+            "\t\tsub {};\n",
+            "\t\tflavor-prop = \"flavor-legacy\";\n",
+            "\t};\n",
+            "",
+            "\tdev@2 {\n",
+            "\t\tcompatible = \"vendor,dev\";\n",
+            "\t\treq-prop;\n",
+            "\t\tsub {};\n",
+            "\t\tflavor-prop = \"cherry\";\n",
+            "\t};\n",
+            "};\n",
+        );
+        let bindings = dev_bindings();
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let diags = diags_for(&project, &paths[0], &bindings);
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+        assert_eq!(diags[0].kind, ErrorCode::CustomHint);
+        assert!(diags[0]
+            .message
+            .contains("value `flavor-legacy` is deprecated — binding `vendor,dev`"));
+        // anchored at the flavor value (line 7, col of the string)
+        assert_eq!(diags[0].span.start().line() as usize, 7);
+        let compat_line = text.lines().position(|l| l.contains("dev@1")).unwrap();
+        assert!(diags[0].span.start().line() as usize > compat_line);
     }
 
     #[test]

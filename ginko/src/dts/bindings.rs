@@ -176,6 +176,13 @@ pub struct PropertyHint {
     /// special case: a node's own `compatible` candidates are the values of
     /// its `compatible` property.
     pub values: Vec<String>,
+    /// Deprecated VALUE spellings of this property — `deprecated: true`
+    /// riding a NESTED constraint (a oneOf/anyOf branch, an items slot):
+    /// the qcom,kpss-wdt class (`- const: qcom,kpss-wdt / deprecated:
+    /// true`), the allwinner sram enum branch. The property's OWN
+    /// `deprecated:` flag rides `deprecated` above instead — never both:
+    /// a wholly-deprecated property marks the NAME, not each spelling.
+    pub deprecated_values: Vec<String>,
     /// Define-prefix families referenced by the description ("Use one of
     /// the LED_COLOR_ID_* prefixed definitions …"), mapped to the relative
     /// header path that defines them.
@@ -1142,6 +1149,8 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
     let define_families = define_families_from(description.as_deref());
     let mut values = Vec::new();
     collect_value_strings(sub, &mut values);
+    let mut deprecated_values = Vec::new();
+    collect_deprecated_values(sub, &mut deprecated_values);
     PropertyHint {
         required,
         boolean,
@@ -1149,8 +1158,138 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
         description,
         deprecated,
         values,
+        deprecated_values,
         define_families,
         child_object: node_like(sub),
+    }
+}
+
+/// Deprecated VALUE spellings of a property: a value whose EVERY
+/// justification rides a `deprecated: true` constraint — the difference
+/// of two sweeps over the sub-schema (the full spelling inventory minus
+/// the spellings reachable without crossing a deprecated constraint).
+/// Members justified by good constraints stay clean: fsl-imx-esdhc's
+/// legacy fallback tuples (`items: [enum: imx8mm-usdhc..., const:
+/// imx7d-usdhc] / deprecated: true`) mark the SHAPE, never its
+/// spellings — imx7d-usdhc and imx8mm-usdhc also live in the good
+/// single-string enums (the gate census proved the naive per-branch
+/// reading with six stock leaks); qcom,kpss-wdt likewise rides good
+/// modern tuples. The truly deprecated class: `{const:
+/// hardkernel,odroid-xu3-audio, deprecated: true}` — a spelling whose
+/// only justification IS the deprecated branch. The property's OWN
+/// `deprecated:` flag is deliberately ignored at the TOP level (it
+/// marks the NAME, feeding `hint.deprecated`; double-marking every
+/// spelling would report both messages on a single use). Never descends
+/// into `properties`/`patternProperties` — other properties' and
+/// children's constraints, the same skip collect_value_strings keeps.
+fn collect_deprecated_values(value: &Value, out: &mut Vec<String>) {
+    fn local_spellings(node: &Value) -> Vec<String> {
+        let Value::Mapping(map) = node else {
+            return Vec::new();
+        };
+        let mut spellings = Vec::new();
+        for (key, val) in map.iter() {
+            match key.as_str() {
+                Some("const") => {
+                    if let Some(scalar) = scalar_string(val) {
+                        spellings.push(scalar);
+                    }
+                }
+                Some("enum") => {
+                    if let Value::Sequence(items) = val {
+                        for item in items {
+                            if let Some(scalar) = scalar_string(item) {
+                                spellings.push(scalar);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        spellings
+    }
+    const SKIP_KEYS: [&str; 3] = ["properties", "patternProperties", "examples"];
+
+    // sweep one: the FULL spelling inventory, everywhere
+    fn sweep_all(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Mapping(map) => {
+                for (key, val) in map.iter() {
+                    match key.as_str() {
+                        Some("const") => {
+                            if let Some(scalar) = scalar_string(val) {
+                                out.push(scalar);
+                            }
+                        }
+                        Some("enum") => {
+                            if let Value::Sequence(items) = val {
+                                for item in items {
+                                    if let Some(scalar) = scalar_string(item) {
+                                        out.push(scalar);
+                                    }
+                                }
+                            }
+                        }
+                        Some(key) if SKIP_KEYS.contains(&key) => {}
+                        _ => sweep_all(val, out),
+                    }
+                }
+            }
+            Value::Sequence(items) => {
+                for item in items {
+                    sweep_all(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // sweep two: spellings justified by NON-deprecated constraints —
+    // a deprecated dict's own spellings AND everything below it are
+    // excluded, but the TOP mapping's own flag is the NAME-level marker
+    // (ignored here, honoured by `hint.deprecated`)
+    fn sweep_justified(
+        node: &Value,
+        inherited: bool,
+        top_level: bool,
+        out: &mut Vec<String>,
+    ) {
+        match node {
+            Value::Mapping(map) => match inherited {
+                true => {}
+                false => {
+                    let self_deprecated = !top_level
+                        && matches!(node.get("deprecated"), Some(Value::Bool(true)));
+                    if !self_deprecated {
+                        out.extend(local_spellings(node));
+                    }
+                    for (key, val) in map.iter() {
+                        match key.as_str() {
+                            Some("deprecated") => {}
+                            Some(key) if SKIP_KEYS.contains(&key) => {}
+                            _ => sweep_justified(val, self_deprecated, false, out),
+                        }
+                    }
+                }
+            },
+            Value::Sequence(items) => {
+                for item in items {
+                    sweep_justified(item, inherited, false, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut all = Vec::new();
+    sweep_all(value, &mut all);
+    let mut justified = Vec::new();
+    sweep_justified(value, false, true, &mut justified);
+    for spelling in &all {
+        if !justified.contains(spelling) && !out.contains(spelling) {
+            out.push(spelling.clone());
+        }
     }
 }
 
@@ -1250,6 +1389,11 @@ pub fn merge_hint(dst: &mut PropertyHint, src: &PropertyHint) {
     for value in &src.values {
         if !dst.values.contains(value) {
             dst.values.push(value.clone());
+        }
+    }
+    for value in &src.deprecated_values {
+        if !dst.deprecated_values.contains(value) {
+            dst.deprecated_values.push(value.clone());
         }
     }
     if dst.type_hint.is_none() {
@@ -1446,8 +1590,14 @@ fn collect_child_entries(
 /// distinction, so completion invents one: a mapping entry is node-like
 /// when it (or any of its flat views — inline, `allOf`, `$ref` chases)
 /// carries non-empty nested `properties`/`patternProperties` (e.g. bare
-/// `port@0: $ref: audio-graph-port.yaml#` entries).
+/// `port@0: $ref: audio-graph-port.yaml#` entries), or is spelled
+/// `{type: object}` — the graph.yaml `endpoint: {type: object}` slot
+/// class: minimal subschemas that are NODES nevertheless, previously
+/// mislabeled as `= $0;` leaf properties.
 fn node_like(value: &Value) -> bool {
+    if matches!(value.get("type"), Some(Value::String(object)) if object == "object") {
+        return true;
+    }
     for key in ["properties", "patternProperties"] {
         if let Some(Value::Mapping(inner)) = value.get(key) {
             if !inner.is_empty() {
