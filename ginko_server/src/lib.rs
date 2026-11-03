@@ -742,6 +742,27 @@ impl LanguageServer for Backend {
                     item.sort_text = Some("0".to_string());
                 }
             }
+            // UNIVERSAL FALLBACK for candidate-less nodes: every pool
+            // above is keyed off the node's own (or an ancestor's)
+            // compatible, so a fresh node whose compatible is not typed
+            // yet produced ZERO items — exactly the moment the user is
+            // typing `compat…` and needs help STARTING the node. Offer
+            // the two dt-specification properties valid on essentially
+            // every device node, and ONLY when nothing else exists:
+            // governed positions never take noise from this, and no
+            // binding-derived list is ever shadowed by it.
+            if items.is_empty() {
+                for name in ["compatible", "status"] {
+                    items.push(CompletionItem {
+                        label: name.to_string(),
+                        detail: Some("property".to_string()),
+                        kind: Some(CompletionItemKind::FIELD),
+                        insert_text: Some(format!("{name} = $0;")),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
             Some(CompletionResponse::Array(items))
         }
 
