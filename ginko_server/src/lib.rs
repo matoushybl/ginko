@@ -665,6 +665,83 @@ impl LanguageServer for Backend {
                 }
                 items.push(item);
             }
+            // PATTERN-CHILD node-creation samples: patternProperties keys
+            // (never literal keys — those flowed through the hint maps
+            // above) distilled to typeable names — `^led(-.*)?$` ->
+            // `led`, the iomuxc `grp$` -> `grp`
+            for sample in bindings.child_node_samples(&node_compatibles(rnode)) {
+                if items.iter().any(|item| item.label == sample) {
+                    continue;
+                }
+                let snippet = format!("{sample} {{\n\t$0\n}};");
+                items.push(CompletionItem {
+                    label: sample.clone(),
+                    detail: Some("child node (pattern)".to_string()),
+                    kind: Some(CompletionItemKind::MODULE),
+                    insert_text: Some(snippet),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                });
+            }
+            // REQUIREMENT-STUB overlays — the completion twin of the
+            // validator's either/or and dependentRequired checks: every
+            // contract member carries the full disjunction/dependency
+            // phrase (documented on present items, spawned as bare stubs
+            // otherwise)
+            let compatibles = node_compatibles(rnode);
+            let (alternation_phrases, dependency_phrases) =
+                bindings.requirement_stub_phrases(&compatibles);
+            for (name, phrase) in alternation_phrases
+                .iter()
+                .chain(dependency_phrases.iter())
+            {
+                let contract = format!("Binding contract: {phrase}.");
+                if let Some(item) = items.iter_mut().find(|item| item.label == *name) {
+                    let documentation = item
+                        .documentation
+                        .get_or_insert_with(|| {
+                            Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: String::new(),
+                            })
+                        });
+                    if let Documentation::MarkupContent(content) = documentation {
+                        if !content.value.contains(&contract) {
+                            if !content.value.is_empty() {
+                                content.value.push_str("\n\n");
+                            }
+                            content.value.push_str(&contract);
+                        }
+                    }
+                    item.sort_text = Some("1".to_string());
+                } else {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        detail: Some("property".to_string()),
+                        kind: Some(CompletionItemKind::FIELD),
+                        insert_text: Some(format!("{name} = $0;")),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        documentation: Some(Documentation::MarkupContent(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: contract,
+                        })),
+                        sort_text: Some("1".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+            // REQUIRED-first ranking: concrete sortTexts let editors
+            // float the required names above everything else (missing
+            // sortText falls back to the label; '0'/'1' sit before
+            // any letter)
+            for item in &mut items {
+                if item.sort_text.is_some() {
+                    continue;
+                }
+                if matches!(item.detail.as_deref(), Some("required property")) {
+                    item.sort_text = Some("0".to_string());
+                }
+            }
             Some(CompletionResponse::Array(items))
         }
 

@@ -312,6 +312,12 @@ fn check_node(
             if candidates.contains(string.item()) {
                 continue;
             }
+            // an EMPTY string is a half-typed value (the caret still
+            // sits inside the quotes while the user is typing) — never
+            // judged, or every property value would fire mid-typing
+            if string.item().is_empty() {
+                continue;
+            }
             let expected = candidates
                 .iter()
                 .take(6)
@@ -501,6 +507,28 @@ properties:
         let (project, _temp, paths) = open_project(&[("test.dts", text)]);
         let bindings = dev_bindings();
         // cells/macro values are never judged against string enums
+        assert!(diags_for(&project, &paths[0], &bindings).is_empty());
+    }
+
+    #[test]
+    pub fn empty_string_values_are_never_judged() {
+        // a `property = "";` is a HALF-TYPED value — the caret still
+        // sits inside the quotes while the user is picking a spelling
+        // (the condval battery's `power-domain-names = "";` case).
+        // Firing the string-enum oracle mid-typing would flag every
+        // property value the moment its quotes close
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tdev@1 {\n",
+            "\t\tcompatible = \"vendor,dev\";\n",
+            "\t\treq-prop;\n",
+            "\t\tsub {};\n",
+            "\t\tenum-prop = \"\";\n",
+            "\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let bindings = dev_bindings();
         assert!(diags_for(&project, &paths[0], &bindings).is_empty());
     }
 

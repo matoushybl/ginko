@@ -404,6 +404,78 @@ impl Bindings {
         merged
     }
 
+    /// Typeable CHILD-NODE sample names for a node matched by
+    /// `compatibles` — patternProperties children of every cited schema
+    /// distilled through `pattern_samples` (the completion twin of
+    /// `$nodename` validation: that round judges existing names exactly,
+    /// this round proposes names to type). Literal-key children already
+    /// complete via `properties_for`'s child_object hints; the server
+    /// de-dupes by label.
+    pub fn child_node_samples(&self, compatibles: &[String]) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for compatible in compatibles {
+            for idx in self.by_compatible.get(compatible).into_iter().flatten() {
+                for child in &self.schemas[*idx].children {
+                    for pattern in &child.patterns {
+                        out.extend(pattern_samples(pattern));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The COMPLETION twin of the either/or (`requirement_alternations`)
+    /// and dependentRequired (`dependencies`) validator checks: per-name
+    /// contract phrases to surface in completion. Over-collects by
+    /// compatibility exactly like `properties_for` — completion surfaces,
+    /// it never judges. Returns (alternation members -> "at least one of:
+    /// …", dependent names -> "required when `<trigger>` is present");
+    /// the phrase is the FULL branch list so every member advertises the
+    /// whole disjunction.
+    pub fn requirement_stub_phrases(
+        &self,
+        compatibles: &[String],
+    ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let mut alternations = BTreeMap::new();
+        let mut dependencies = BTreeMap::new();
+        for compatible in compatibles {
+            for idx in self.by_compatible.get(compatible).into_iter().flatten() {
+                for disjunction in &self.schemas[*idx].requirement_alternations {
+                    let mut names: Vec<&str> = Vec::new();
+                    for branch in &disjunction.branches {
+                        for name in branch {
+                            if !names.contains(&name.as_str()) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    if names.is_empty() {
+                        continue;
+                    }
+                    let joined = names
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let phrase = format!("at least one of: {joined}");
+                    for name in names {
+                        alternations.insert(name.to_string(), phrase.clone());
+                    }
+                }
+                for (trigger, dependents) in &self.schemas[*idx].dependencies {
+                    for dependent in dependents {
+                        dependencies.insert(
+                            dependent.clone(),
+                            format!("required when `{trigger}` is present"),
+                        );
+                    }
+                }
+            }
+        }
+        (alternations, dependencies)
+    }
+
     fn add_file(&mut self, path: &Path) {
         let Ok(text) = fs::read_to_string(path) else {
             return;
@@ -1480,6 +1552,100 @@ fn split_patterns(pattern: &str) -> Vec<String> {
         .collect()
 }
 
+/// Typeable CHILD-NODE sample names suggested for a patternProperties
+/// key — the completion twin of `$nodename` validation (that round
+/// JUDGES existing names with exact regexes; this round PROPOSES names
+/// for new ones). Top-level alternation branches fork; literal walks
+/// accumulate; a REQUIRED meta run (wildcard, class, quantifier —
+/// `.*-supply$`, `^.*@[0-9a-f]+$`) is too generic to suggest and yields
+/// nothing, except the classic `name@[0-9a-f]+$` unit-address class which
+/// keeps the `@0` convention. An optional group stops the walk and emits
+/// the head (`^led(-.*)?$` -> `led`; `^port(@.+)?$` -> `port`);
+/// inner-anchored branches re-walk deanchored (`(^led-[0-9a-f]$|led)`
+/// -> `led`).
+pub fn pattern_samples(pattern: &str) -> Vec<String> {
+    fn record(head_now: &str, out: &mut BTreeSet<String>) {
+        if !head_now.is_empty() {
+            out.insert(head_now.to_string());
+        }
+    }
+    fn expand(mut prefix: String, rest: &str, out: &mut BTreeSet<String>) {
+        let chars: Vec<char> = rest.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' if i + 1 < chars.len() => {
+                    prefix.push(chars[i + 1]);
+                    i += 2;
+                }
+                '^' | '$' => i += 1, // inner anchors are lexical no-ops
+                '(' => {
+                    // split the balanced group into (interior, after, quantifier)
+                    let mut depth = 1;
+                    let mut close = i + 1;
+                    while close < chars.len() && depth > 0 {
+                        match chars[close] {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        close += 1;
+                    }
+                    // close now sits one past ')'; the interior is between
+                    let interior: String = chars[i + 1..close.saturating_sub(1)]
+                        .iter()
+                        .collect();
+                    let quantified = matches!(chars.get(close), Some('*') | Some('?'));
+                    let after: String = chars[close + usize::from(quantified)..]
+                        .iter()
+                        .collect();
+                    if quantified {
+                        // an optional tail never shapes a typeable
+                        // suggestion on its own — freeze what we have
+                        record(&prefix, out);
+                        return;
+                    }
+                    // required group: fork every top-level alternative,
+                    // branch + remainder re-walked as fresh text
+                    for branch in split_patterns(&interior) {
+                        let joined = format!("{branch}{after}");
+                        expand(prefix.clone(), &joined, out);
+                    }
+                    return;
+                }
+                '[' | '.' | '+' | '{' | '|' => {
+                    // required meta: too generic — UNLESS the head sits on a
+                    // unit-address '@' (`^sdhci@[0-9a-f]+$` -> `sdhci@0`)
+                    if prefix.ends_with('@') {
+                        prefix.push('0');
+                        record(&prefix, out);
+                    }
+                    return;
+                }
+                '?' | '*' => {
+                    // a bare quantifier optionals the previous char: the
+                    // head up to it is the concrete suggestion
+                    record(&prefix, out);
+                    return;
+                }
+                literal => {
+                    prefix.push(literal);
+                    i += 1;
+                }
+            }
+        }
+        record(&prefix, out);
+    }
+    let trimmed = pattern.trim();
+    let mut unanchored = trimmed.strip_prefix('^').unwrap_or(trimmed);
+    if let Some(stripped) = unanchored.strip_suffix('$') {
+        unanchored = stripped;
+    }
+    let mut out = BTreeSet::new();
+    expand(String::new(), unanchored, &mut out);
+    out.into_iter().collect()
+}
+
 /// Whether the child node NAME matches the binding pattern keys.
 /// Alternatives test in order; plain literals bind via contains/prefix/
 /// suffix/equality per anchors, regex-y alternatives (character classes,
@@ -2000,6 +2166,106 @@ properties:
         assert_eq!(mode.values, vec!["host".to_string()]);
         let spare = &properties["spare"];
         assert_eq!(spare.values, vec!["lone-spelling".to_string()]);
+    }
+
+    #[test]
+    pub fn pattern_samples_expand_only_typeable_heads() {
+        // the real patternProperties key classes, one behavior each:
+        // literal heads emit; alternations fork; optional groups freeze
+        // the head; required meta runs drop (too generic) — except the
+        // unit-address `[class]` keeping the `@0` convention
+        assert_eq!(pattern_samples("grp$"), vec!["grp".to_string()]);
+        assert_eq!(pattern_samples("(^led-[0-9a-f]$|led)"), vec!["led".to_string()]);
+        assert_eq!(pattern_samples("^led(-.*)?$"), vec!["led".to_string()]);
+        assert_eq!(pattern_samples("^port(@.+)?$"), vec!["port".to_string()]);
+        assert_eq!(
+            pattern_samples("^(cpu|cluster)-"),
+            vec!["cluster-".to_string(), "cpu-".to_string()]
+        );
+        assert_eq!(
+            pattern_samples("^sdhci@[0-9a-f]+$"),
+            vec!["sdhci@0".to_string()]
+        );
+        assert!(pattern_samples("^.*@[0-9a-f]+$").is_empty());
+        assert!(pattern_samples(".*-supply$").is_empty());
+        assert!(pattern_samples("^.*@[0-9a-f]{1,2}$").is_empty());
+    }
+
+    const PATTERN_CHILD_BINDING: &str = r#"
+properties:
+  compatible:
+    const: vendor,checker
+patternProperties:
+  "^led(-.*)?$":
+    type: object
+    properties:
+      gpios:
+        description: the led gpio
+"#;
+
+    #[test]
+    pub fn child_node_samples_from_pattern_children() {
+        // patternProperties keys surface as typeable node-creation
+        // samples through the cited compatible; purely-regex keys
+        // (dropped by the sampler) contribute nothing
+        let binding: Value = serde_yaml::from_str(PATTERN_CHILD_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("vendor/checker.yaml"), &binding);
+        let samples = bindings.child_node_samples(&["vendor,checker".to_string()]);
+        assert_eq!(samples, BTreeSet::from(["led".to_string()]));
+        // unknown compatible: no samples
+        assert!(bindings
+            .child_node_samples(&["vendor,unknown".to_string()])
+            .is_empty());
+    }
+
+    const STUB_BINDING: &str = r#"
+properties:
+  compatible:
+    const: vendor,stub-charger
+  gpios:
+    description: presence gpio
+  charge-current-limit-gpios:
+    description: current limit gpio
+required:
+  - compatible
+dependencies:
+  charge-current-limit-gpios:
+    - charge-current-limit-mapping
+oneOf:
+  - required:
+      - gpios
+  - required:
+      - charge-current-limit-gpios
+"#;
+
+    #[test]
+    pub fn requirement_stub_phrases_carry_the_whole_contract() {
+        // the completion twin of either/or + dependentRequired: every
+        // disjunction member carries the FULL branch list; dependent
+        // names carry their trigger
+        let binding: Value = serde_yaml::from_str(STUB_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("gpio-charger.yaml"), &binding);
+        let (alternations, dependencies) =
+            bindings.requirement_stub_phrases(&["vendor,stub-charger".to_string()]);
+        let phrase = "at least one of: `gpios`, `charge-current-limit-gpios`";
+        assert_eq!(
+            alternations.get("gpios").map(String::as_str),
+            Some(phrase)
+        );
+        assert_eq!(
+            alternations
+                .get("charge-current-limit-gpios")
+                .map(String::as_str),
+            Some(phrase)
+        );
+        assert_eq!(
+            dependencies
+                .get("charge-current-limit-mapping")
+                .map(String::as_str),
+            Some("required when `charge-current-limit-gpios` is present")
+        );
     }
 
     const VALUES_BINDING: &str = r#"
