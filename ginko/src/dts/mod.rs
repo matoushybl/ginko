@@ -21,7 +21,9 @@ pub use ast::{AnyDirective, Node, NodeItem, NodePayload, Primary, PropertyValue}
 pub use bindings::{
     Bindings, CompletionSchema, PropertyHint, fuzzy_compatibles, merge_hint, node_compatibles,
 };
-pub use validate::binding_diagnostics;
+pub use validate::{
+    binding_diagnostics, missing_requirements, MissingRequirement, RequirementKind,
+};
 pub use data::{FileType, HasSource, HasSpan, Position, Span};
 pub use diagnostics::{Diagnostic, DiagnosticPrinter, Severity};
 pub use error_codes::{ErrorCode, SeverityMap};

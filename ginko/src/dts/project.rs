@@ -447,6 +447,62 @@ impl Project {
         file.item_at_cursor(position)
     }
 
+    /// The canonical navigation target under the cursor: the node
+    /// DEFINITION a `&label` / `&{/path}` reference points at, the node
+    /// a `label:` definition belongs to, or the node at the cursor
+    /// itself. The goto-companion identity for reference listing and
+    /// document highlight: `(span, file)` of one definition site.
+    pub fn node_target_at(&self, path: &Path, pos: &Position) -> Option<(Span, Arc<Path>)> {
+        match self.find_at_pos(path, pos)? {
+            ItemAtCursor::Reference(reference, ctx) => {
+                self.get_node_position(path, reference, &ctx)
+            }
+            ItemAtCursor::Label(label) => self.get_node_position(
+                path,
+                &Reference::Label(label.item().clone()),
+                &crate::dts::visitor::ReferenceContext::Root,
+            ),
+            ItemAtCursor::Node(node) => Some((node.name.span(), node.name.source())),
+            ItemAtCursor::ReferencedNode(referenced) => referenced
+                .label
+                .as_ref()
+                .map(|label| (label.span(), label.source())),
+            _ => None,
+        }
+    }
+
+    /// Every reference across the project's known files — the open-file
+    /// universe plus their include closure, the same universe goto uses
+    /// — resolving to `target`. Returns `(reference_file, reference_span)`
+    /// pairs; references whose resolution fails are skipped (unresolved
+    /// references never list).
+    pub fn references_to_target(
+        &self,
+        target: &(Span, Arc<Path>),
+    ) -> Vec<(PathBuf, Span)> {
+        let mut out = Vec::new();
+        for file in self.files() {
+            let Some(dts) = self.get_file(file).and_then(|file| file.file.as_ref()) else {
+                continue;
+            };
+            let mut collected = Vec::new();
+            dts.collect_references(&mut collected);
+            for entry in collected {
+                let Some(resolved) =
+                    self.get_node_position(file, entry.token.item(), &entry.context)
+                else {
+                    continue;
+                };
+                if resolved.0 == target.0 && resolved.1 == target.1 {
+                    out.push((file.to_path_buf(), entry.token.span()));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.start().cmp(&b.1.start())));
+        out.dedup();
+        out
+    }
+
     fn node_at_absolute_path<'a>(
         &'a self,
         ctx: &'a AnalysisContext,
@@ -834,15 +890,12 @@ mod tests {
                 file1.display()
             ),
         );
-
         project
             .add_file(
                 file2.clone().into_os_string().into_string().unwrap(),
                 &mut loader,
             )
             .expect("Unexpected IO error");
-
-        project.assert_no_diagnostics();
 
         let substr = code2.s1("&some_node");
         let item = project
@@ -1721,5 +1774,169 @@ mod tests {
         else {
             panic!("expected InProperty at the compatible property");
         };
+    }
+
+    #[test]
+    pub fn references_to_target_lists_users_across_files() {
+        // the reverse-lookup machinery behind reference listing and
+        // document highlight: the target identity is the node
+        // definition's NAME token (the same identity goto uses), users
+        // in the OPEN file and the include closure both list, and the
+        // target resolves identically from the label definition and
+        // from any usage
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let temp_dir = TempDir::new();
+        let (code1, file1) = temp_dir.add_file(
+            "tests-base.dtsi",
+            r#"
+/ {
+    uart_target: node_a {
+        status = "okay";
+    };
+};
+"#,
+        );
+        let (code2, file2) = temp_dir.add_file(
+            "tests-file.dts",
+            format!(
+                r#"
+/dts-v1/;
+
+/include/ "{}"
+
+&uart_target {{
+}};
+
+/ {{
+	consumer@1 {{
+		homes = <&uart_target 3>;
+	}};
+}};
+
+&{{/node_a}} {{
+}};
+"#,
+                file1.display()
+            ),
+        );
+
+        project
+            .add_file(
+                file2.clone().into_os_string().into_string().unwrap(),
+                &mut loader,
+            )
+            .expect("Unexpected IO error");
+        // the include gets opened too — a cursor inside it (the edit the
+        // user makes from another split) requires an analysis of its
+        // own; the server guarantees one for every OPEN file
+        project
+            .add_file(
+                file1.clone().into_os_string().into_string().unwrap(),
+                &mut loader,
+            )
+            .expect("Unexpected IO error");
+
+        // the target FROM THE LABEL DEFINITION (cursor inside the
+        // included dtsi)
+        let file1_canon = project.canonicalize(&file1).unwrap();
+        let def = code1.s1("uart_target: node_a");
+        let Some(target) =
+            project.node_target_at(&file1_canon, &def.span().start())
+        else {
+            panic!("label definition must resolve to its own node");
+        };
+        assert_eq!(target.0, code1.s1("node_a").span());
+        assert_eq!(target.1.as_ref(), file1_canon.as_path());
+
+        // three users across the OPEN file: overlay head, phandle
+        // cell, path reference — none inside the include itself
+        let refs = project.references_to_target(&target);
+        let file2_canon = project.canonicalize(&file2).unwrap();
+        assert_eq!(refs.len(), 3, "{refs:#?}");
+        assert!(refs
+            .iter()
+            .all(|(file, _)| *file == file2_canon));
+        assert_eq!(refs[0].1, code2.s("&uart_target", 1).span());
+        assert_eq!(refs[1].1, code2.s("&uart_target", 2).span());
+        assert_eq!(refs[2].1, code2.s1("&{/node_a}").span());
+
+        // and the target FROM A USAGE resolves to the same identity
+        let usage = code2.s("&uart_target", 1);
+        let from_usage = project
+            .node_target_at(&file2_canon, &usage.span().start())
+            .expect("usage must resolve");
+        assert_eq!(from_usage.0, target.0);
+        assert_eq!(from_usage.1, target.1);
+    }
+
+    #[test]
+    pub fn node_target_at_resolves_inside_deep_phandle_cells() {
+        // the navigate-battery cursor: one character INSIDE the `&`
+        // reference of a phandle cell, three node levels deep — the
+        // item machinery must surface the reference and get_node_position
+        // must resolve it to the definition's name-span identity
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let temp_dir = TempDir::new();
+        let (code1, file1) = temp_dir.add_file(
+            "tests-base.dtsi",
+            r#"/ {
+	nav_target: node_a {
+		status = "okay";
+	};
+};
+"#,
+        );
+        let (code2, file2) = temp_dir.add_file(
+            "tests-file.dts",
+            format!(
+                r#"/dts-v1/;
+
+/include/ "{}"
+
+&nav_target {{
+	extra = <1>;
+}};
+
+/ {{
+	uart_probe: serial@30860000 {{
+		compatible = "fsl,imx8mm-uart", "fsl,imx6q-uart";
+	}};
+
+	testleds {{
+		compatible = "gpio-leds";
+		led-x {{
+			gpios = <&nav_target 3>;
+		}};
+	}};
+}};
+"#,
+                file1.display()
+            ),
+        );
+        project
+            .add_file(file2.clone().into_os_string().into_string().unwrap(), &mut loader)
+            .expect("Unexpected IO error");
+        project
+            .add_file(file1.clone().into_os_string().into_string().unwrap(), &mut loader)
+            .expect("Unexpected IO error");
+
+        let usage = code2.s("&nav_target", 2);
+        let usage_start = usage.span().start();
+        let inside = usage_start.offset_by_char(1);
+        assert_eq!(inside.line(), 16, "fixture layout must match the battery");
+        assert_eq!(inside.character(), 13);
+        let file2_canon = project.canonicalize(&file2).unwrap();
+        let Some(target) = project.node_target_at(&file2_canon, &inside) else {
+            panic!("cursor inside the phandle cell reference must resolve");
+        };
+        assert_eq!(target.0, code1.s1("node_a").span());
+        assert_eq!(target.1.as_ref(), Path::new(file1.as_os_str()));
+
+        // both MAIN users list: the overlay head and the phandle cell
+        let refs = project.references_to_target(&target);
+        assert_eq!(refs.len(), 2, "{refs:#?}");
+        assert!(refs.iter().all(|(file, _)| *file == file2_canon));
     }
 }

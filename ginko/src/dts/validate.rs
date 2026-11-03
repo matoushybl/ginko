@@ -1,10 +1,166 @@
 use crate::dts::ast::PropertyValue;
-use crate::dts::bindings::{name_matches, node_compatibles, shape_satisfied, Bindings};
+use crate::dts::bindings::{
+    name_matches, node_compatibles, shape_satisfied, Bindings, CompletionSchema,
+};
 use crate::dts::diagnostics::Diagnostic;
 use crate::dts::error_codes::ErrorCode;
 use crate::dts::resolved::{ResolvedNode, ResolvedTree};
 use crate::dts::{HasSource, HasSpan};
 use std::path::Path;
+
+/// One requirement a governed node fails to satisfy — the shared query
+/// consumed by the validator (per-binding diagnostics), the
+/// binding-inspector hover and the required-missing code action.
+#[derive(Debug, Clone)]
+pub enum RequirementKind {
+    /// a plain `required:` entry (possibly a conditional supplement);
+    /// `boolean` marks the `name: true` shape so quick fixes insert
+    /// `name;` rather than `name = ;`
+    Plain { boolean: bool },
+    /// an unsatisfied pure-required disjunction — carries the rendered
+    /// branch phrase ("`a` + `b`, `c`"), with an EMPTY name
+    Alternation { phrase: String },
+    /// a dependentRequired dependent — carries its trigger property
+    Dependent { trigger: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct MissingRequirement {
+    /// the file stem of the binding that imposes the requirement — the
+    /// same per-binding attribution the validator reports
+    pub binding: String,
+    pub name: String,
+    pub kind: RequirementKind,
+}
+
+/// Every unmet requirement of a governed node, across every accepted
+/// binding view, in view order (plain + conditional entries first, then
+/// requirement disjunctions, then dependentRequired dependents).
+pub fn missing_requirements(
+    bindings: &Bindings,
+    compatibles: &[String],
+    node: &ResolvedNode,
+) -> Vec<MissingRequirement> {
+    bindings
+        .normative_views(compatibles)
+        .iter()
+        .flat_map(|(binding, schema)| {
+            view_missing_requirements(binding, schema, compatibles, node)
+        })
+        .collect()
+}
+
+/// The per-binding core of [`missing_requirements`] — one view's plain,
+/// conditional, disjunction and dependency requirements, deduplicated
+/// by the validator's own `fired` semantics (a property demanded twice
+/// through different paths reports once).
+fn view_missing_requirements(
+    binding: &str,
+    schema: &CompletionSchema,
+    compatibles: &[String],
+    node: &ResolvedNode,
+) -> Vec<MissingRequirement> {
+    let mut out: Vec<MissingRequirement> = Vec::new();
+    let mut fired: Vec<String> = Vec::new();
+    // required entries are satisfied by a property OR a child node
+    // bearing the name — the devicetree property/node duality
+    for (name, hint) in schema.properties.iter() {
+        if hint.required && node.get_property(name).is_none() && !node.child_exists(name) {
+            fired.push(name.clone());
+            out.push(MissingRequirement {
+                binding: binding.to_string(),
+                name: name.clone(),
+                kind: RequirementKind::Plain {
+                    boolean: hint.boolean,
+                },
+            });
+        }
+    }
+    // compatible-controlled supplements: the `allOf: [if:, then:]` idiom
+    // — when the node's compatibles satisfy the condition shape, the
+    // then-required names bind too
+    for conditional in &schema.conditionals {
+        if !conditional
+            .shapes
+            .iter()
+            .any(|shape| shape_satisfied(shape, compatibles))
+        {
+            continue;
+        }
+        for (name, hint) in &conditional.properties {
+            if !hint.required
+                || fired.contains(name)
+                || node.get_property(name).is_some()
+                || node.child_exists(name)
+            {
+                continue;
+            }
+            fired.push(name.clone());
+            out.push(MissingRequirement {
+                binding: binding.to_string(),
+                name: name.clone(),
+                kind: RequirementKind::Plain {
+                    boolean: hint.boolean,
+                },
+            });
+        }
+    }
+    // requirement disjunctions: a governed node must satisfy AT LEAST
+    // ONE pure-required branch — carrying several stays silent, the
+    // conservative reading
+    for alternation in &schema.requirement_alternations {
+        let satisfied = alternation.branches.iter().any(|branch| {
+            branch
+                .iter()
+                .all(|name| node.get_property(name).is_some() || node.child_exists(name))
+        });
+        if satisfied {
+            continue;
+        }
+        let phrase = alternation
+            .branches
+            .iter()
+            .map(|branch| {
+                branch
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(MissingRequirement {
+            binding: binding.to_string(),
+            name: String::new(),
+            kind: RequirementKind::Alternation { phrase },
+        });
+    }
+    // dependentRequired: PRESENCE of the trigger property calls for
+    // each dependent name — no trigger, no judgement — along the
+    // property-or-child duality
+    for (trigger, needed) in &schema.dependencies {
+        if !(node.get_property(trigger).is_some() || node.child_exists(trigger)) {
+            continue;
+        }
+        for name in needed {
+            if fired.contains(name)
+                || node.get_property(name).is_some()
+                || node.child_exists(name)
+            {
+                continue;
+            }
+            fired.push(name.clone());
+            out.push(MissingRequirement {
+                binding: binding.to_string(),
+                name: name.clone(),
+                kind: RequirementKind::Dependent {
+                    trigger: trigger.clone(),
+                },
+            });
+        }
+    }
+    out
+}
 
 /// Binding-driven diagnostics over a resolved tree — the editor-side
 /// `dtbs_check` baseline. Deliberately conservative: only compatible-
@@ -123,86 +279,31 @@ fn check_node(
     }
     // required entries are judged PER BINDING so the message names the
     // binding that imposes — the preamble proves which binding's
-    // requires list a property lives on
+    // requires list a property lives on. The shared query provides the
+    // entries; plain/disjunction diagnostics render inline, the
+    // dependentRequired ones AFTER the nodename check (the historical
+    // diagnostic order this validator always emitted)
     for (binding, schema) in &views {
-        let mut fired: Vec<String> = Vec::new();
-        for (name, hint) in schema.properties.iter() {
-            // required entries are satisfied by a property OR a child node
-            // bearing the name — the devicetree property/node duality
-            if hint.required
-                && node.get_property(name).is_none()
-                && !node.child_exists(name)
-            {
-                fired.push(name.clone());
-                out.push(Diagnostic::new(
+        let missing = view_missing_requirements(binding, schema, &compatibles, node);
+        for entry in missing
+            .iter()
+            .filter(|entry| !matches!(entry.kind, RequirementKind::Dependent { .. }))
+        {
+            match &entry.kind {
+                RequirementKind::Plain { .. } => out.push(Diagnostic::new(
                     identity.name.span(),
                     identity.end.source(),
                     ErrorCode::CustomWarning,
-                    format!("binding `{binding}` requires property `{name}`"),
-                ));
-            }
-        }
-        // compatible-controlled supplements: the `allOf: [if:, then:]`
-        // idiom — when the node's compatibles satisfy the condition
-        // shape, the then-required names bind too (the fsl,imx8mp-xcvr
-        // `resets` idiom, ~240 kernel bindings); the then-VALUES flow
-        // through the pooled hint map instead (enum judgement)
-        for conditional in &schema.conditionals {
-            if !conditional
-                .shapes
-                .iter()
-                .any(|shape| shape_satisfied(shape, &compatibles))
-            {
-                continue;
-            }
-            for (name, hint) in &conditional.properties {
-                if !hint.required
-                    || fired.contains(name)
-                    || node.get_property(name).is_some()
-                    || node.child_exists(name)
-                {
-                    continue;
-                }
-                fired.push(name.clone());
-                out.push(Diagnostic::new(
+                    format!("binding `{binding}` requires property `{}`", entry.name),
+                )),
+                RequirementKind::Alternation { phrase } => out.push(Diagnostic::new(
                     identity.name.span(),
                     identity.end.source(),
                     ErrorCode::CustomWarning,
-                    format!("binding `{binding}` requires property `{name}`"),
-                ));
+                    format!("binding `{binding}` requires one of: {phrase}"),
+                )),
+                RequirementKind::Dependent { .. } => unreachable!("filtered above"),
             }
-        }
-        // requirement disjunctions: a governed node must satisfy AT
-        // LEAST ONE pure-required branch (the `interrupts` vs
-        // `interrupts-extended` idiom, `clocks` vs `power-domains`) —
-        // carrying several stays silent, the conservative reading
-        for alternation in &schema.requirement_alternations {
-            let satisfied = alternation.branches.iter().any(|branch| {
-                branch.iter().all(|name| {
-                    node.get_property(name).is_some() || node.child_exists(name)
-                })
-            });
-            if satisfied {
-                continue;
-            }
-            let expected = alternation
-                .branches
-                .iter()
-                .map(|branch| {
-                    branch
-                        .iter()
-                        .map(|name| format!("`{name}`"))
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push(Diagnostic::new(
-                identity.name.span(),
-                identity.end.source(),
-                ErrorCode::CustomWarning,
-                format!("binding `{binding}` requires one of: {expected}"),
-            ));
         }
         // $nodename shaping: the binding's `properties.$nodename`
         // constrains the NAME of the nodes it governs — the LENIENT
@@ -221,28 +322,20 @@ fn check_node(
                 ));
             }
         }
-        // dependentRequired: PRESENCE of the trigger property calls
-        // for each dependent name (gpio-charger's
-        // charge-current-limit-gpios ⇒ charge-current-limit-mapping) —
-        // no trigger, no judgement — along the property-or-child duality
-        for (trigger, needed) in &schema.dependencies {
-            if !(node.get_property(trigger).is_some() || node.child_exists(trigger)) {
-                continue;
-            }
-            for name in needed {
-                if fired.contains(name)
-                    || node.get_property(name).is_some()
-                    || node.child_exists(name)
-                {
-                    continue;
-                }
-                fired.push(name.clone());
+        // dependentRequired render — from the query's Dependent entries,
+        // after the nodename check: the historical diagnostic order
+        for entry in missing
+            .iter()
+            .filter(|entry| matches!(entry.kind, RequirementKind::Dependent { .. }))
+        {
+            if let RequirementKind::Dependent { trigger } = &entry.kind {
                 out.push(Diagnostic::new(
                     identity.name.span(),
                     identity.end.source(),
                     ErrorCode::CustomWarning,
                     format!(
-                        "binding `{binding}` requires property `{name}` alongside `{trigger}`"
+                        "binding `{binding}` requires property `{}` alongside `{trigger}`",
+                        entry.name
                     ),
                 ));
             }
@@ -1454,6 +1547,95 @@ dependencies:
             .iter()
             .any(|d| d.message.contains(
                 "binding `vendor,dep` requires property `node-need` alongside `node-trigger`"
+            )));
+    }
+
+    #[test]
+    pub fn missing_requirements_query_exposes_contract_kinds() {
+        // the shared query behind the binding-inspector hover and the
+        // required-missing quick fix: plain entries carry their boolean
+        // shape, disjunctions carry their FULL branch phrase with an
+        // empty name, dependentRequired carry their trigger; satisfied
+        // requirements (present property) never appear
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vendor,query.yaml"),
+            r#"
+properties:
+  compatible:
+    const: vendor,query
+  boolflag:
+    type: boolean
+  plain:
+    description: plain required
+  a: true
+  b: true
+  c: true
+  trigger: true
+  dependent: true
+required:
+  - compatible
+  - boolflag
+  - plain
+oneOf:
+  - required:
+      - a
+      - b
+  - required:
+      - c
+dependencies:
+  trigger:
+    - dependent
+"#,
+        )
+        .unwrap();
+        let bindings = Bindings::from_paths(&[dir.path().to_path_buf()]);
+        let text = concat!(
+            "/dts-v1/;\n\n/ {\n",
+            "\tq {\n\t\tcompatible = \"vendor,query\";\n\t\tplain = <1>;\n\t};\n",
+            "\tqt {\n\t\tcompatible = \"vendor,query\";\n\t\tplain;\n\t\ttrigger;\n\t\tc;\n\t};\n",
+            "};\n",
+        );
+        let (project, _temp, paths) = open_project(&[("test.dts", text)]);
+        let compatibles = vec!["vendor,query".to_string()];
+
+        // node `q`: missing boolflag (boolean), unsatisfied disjunction,
+        // NO dependent (trigger absent)
+        let i_q = text.split('\n').position(|l| l == "\tq {").unwrap() as u32;
+        let Some(crate::dts::CompletionContext::InNode(q)) =
+            project.completion_context_at(&paths[0], &crate::dts::Position::new(i_q, 3))
+        else {
+            panic!("node q must resolve");
+        };
+        let q_missing = missing_requirements(&bindings, &compatibles, q);
+        assert_eq!(q_missing.len(), 2, "{:#?}", q_missing);
+        assert!(matches!(
+            &q_missing[0],
+            MissingRequirement { name, kind: RequirementKind::Plain { boolean: true }, .. }
+                if name == "boolflag"
+        ));
+        assert!(matches!(
+            &q_missing[1],
+            MissingRequirement { name, kind: RequirementKind::Alternation { phrase }, .. }
+                if name.is_empty() && phrase == "`a` + `b`, `c`"
+        ));
+
+        // node `qt`: only the dependentRequired entry remains (trigger
+        // present) — boolflag still missing, so the plain entry ships too
+        let i_qt = text.split('\n').position(|l| l == "\tqt {").unwrap() as u32;
+        let Some(crate::dts::CompletionContext::InNode(qt)) =
+            project.completion_context_at(&paths[0], &crate::dts::Position::new(i_qt, 4))
+        else {
+            panic!("node qt must resolve");
+        };
+        let qt_missing = missing_requirements(&bindings, &compatibles, qt);
+        assert_eq!(qt_missing.len(), 2, "{:#?}", qt_missing);
+        assert!(qt_missing
+            .iter()
+            .any(|entry| matches!(
+                entry,
+                MissingRequirement { name, kind: RequirementKind::Dependent { trigger }, .. }
+                    if name == "dependent" && trigger == "trigger"
             )));
     }
 }

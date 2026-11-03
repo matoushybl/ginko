@@ -1,9 +1,9 @@
 use ginko::dts::{
     AnyDirective, Bindings, CompletionContext, FileType, HasSpan, IncludeLoader,
-    IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node, NodeItem, NodePayload,
-    ParserConfig, Primary, Project, PropertyValue, ResolvedContext, ResolvedNode,
-    ResolvedProperty, Severity, SeverityMap, Span, binding_diagnostics, fuzzy_compatibles,
-    merge_hint, node_compatibles,
+    IncludeLoaderGuard, IncludeLoaderNotifyAction, ItemAtCursor, Node,
+    NodeItem, NodePayload, ParserConfig, Primary, Project, PropertyValue, RequirementKind,
+    ResolvedContext, ResolvedNode, ResolvedProperty, Severity, SeverityMap, Span,
+    binding_diagnostics, fuzzy_compatibles, merge_hint, missing_requirements, node_compatibles,
 };
 use ginko::header::{Define, TokenKind, parse_header};
 use itertools::Itertools;
@@ -168,6 +168,50 @@ impl Backend {
         Some((defines, resolved))
     }
 
+    /// The single-macro include quick fix: an identifier inside a property
+    /// whose binding description names a header (the define-family
+    /// machinery auto-include completion uses) — the action's TextEdit is
+    /// the identical include line completion attaches.
+    fn include_fix(
+        &self,
+        project: &Project,
+        file_path: &Path,
+        pos: &ginko::dts::Position,
+        label: &str,
+    ) -> Option<TextEdit> {
+        let Some(CompletionContext::InProperty(rnode, property)) =
+            project.completion_context_at(file_path, pos)
+        else {
+            return None;
+        };
+        // the property's name resolves the binding hints carrying the
+        // define families (own binding, then ancestor child hints,
+        // then common schemas — the standing precedence)
+        let property_name = property.property().name.item().clone();
+        let hint =
+            property_hints_at(project, file_path, pos, rnode, &property_name, &self.bindings)?;
+
+        let (prefix, header) = hint
+            .define_families
+            .iter()
+            .find(|(family_prefix, _)| label.starts_with(family_prefix.as_str()))?;
+        let (defines, resolved) = self.header_defines(header, file_path)?;
+        let representative = defines.iter().find_map(|define| {
+            let TokenKind::Ident(ident) = &define.name.kind else {
+                return None;
+            };
+            (!define.fn_like && ident.starts_with(prefix.as_str()))
+                .then(|| ident.clone())
+        })?;
+        let include_line = if header.starts_with("include/") {
+            format!("#include <{}>", dts_include_path(header))
+        } else {
+            let file_name = resolved.file_name()?;
+            format!("#include \"{}\"", file_name.to_string_lossy())
+        };
+        additional_include_edit(project, file_path, &representative, &include_line)
+    }
+
     /// Expand bracket alternative lists in a header mention:
     /// `imx8m[m,n,p,q]-pinfunc.h` becomes one variant per SoC. Bracket
     /// groups without a comma (character classes like `[0-9a-f]`) and
@@ -319,6 +363,18 @@ impl LanguageServer for Backend {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        resolve_provider: Some(false),
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        work_done_progress_options: WorkDoneProgressOptions {
+                            work_done_progress: None,
+                        },
+                    },
+                )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
@@ -518,30 +574,6 @@ impl LanguageServer for Backend {
         /// one-element path — is the v1 direct-child lookup; shallower
         /// hops light up grandchild chains (ports → port@N → endpoint)
         /// through compatible-less intermediate nodes.
-        fn child_binding_hints(
-            project: &Project,
-            file_path: &Path,
-            pos: &ginko::dts::Position,
-            bindings: &Bindings,
-        ) -> Option<BTreeMap<String, ginko::dts::PropertyHint>> {
-            let analysis = project.get_analysis(file_path)?;
-            let tree = analysis.get_resolved_tree();
-            let file = project.canonical_path(file_path);
-            let (_, trail) = tree.node_and_path_at_position(&file, pos)?;
-            let mut merged: BTreeMap<String, ginko::dts::PropertyHint> = BTreeMap::new();
-            for split in (0..trail.len()).rev() {
-                let Some(ancestor) = tree.node_at_path(&trail[..split]) else {
-                    continue;
-                };
-                let hints =
-                    bindings.child_properties_for(&node_compatibles(ancestor), &trail[split..]);
-                for (name, hint) in hints {
-                    merge_hint(merged.entry(name).or_default(), &hint);
-                }
-            }
-            (!merged.is_empty()).then_some(merged)
-        }
-
         fn completions_for_node(
             rnode: &ResolvedNode,
             bindings: &Bindings,
@@ -964,58 +996,6 @@ impl LanguageServer for Backend {
         /// The DTS spelling of a binding-relative header path: strip the
         /// leading `include/` — `#include <dt-bindings/…>` resolves against
         /// the `--include` roots.
-        fn dts_include_path(relative: &str) -> String {
-            relative
-                .strip_prefix("include/")
-                .unwrap_or(relative)
-                .to_string()
-        }
-
-        /// The `#include <…>` TextEdit to attach to header-define completion
-        /// items when the family's defines are not yet in scope for the
-        /// completed file. None when an already-included header (directly or
-        /// transitively) provides the defines. `include_line` is the full
-        /// statement to insert (`#include <…>` or `#include "…"`).
-        fn additional_include_edit(
-            project: &Project,
-            file_path: &Path,
-            representative_define: &str,
-            include_line: &str,
-        ) -> Option<TextEdit> {
-            if project
-                .get_analysis(file_path)
-                .and_then(|analysis| analysis.get_define(representative_define))
-                .is_some()
-            {
-                return None;
-            }
-            let source = project.file_source(file_path)?;
-            let line = include_insert_line(source);
-            Some(TextEdit {
-                range: Range::new(Position::new(line, 0), Position::new(line, 0)),
-                new_text: format!("{include_line}\n"),
-            })
-        }
-
-        /// Insert the new `#include` after the last existing one, else after
-        /// the `/dts-v1/;` directive, else at the top of the file.
-        fn include_insert_line(source: &str) -> u32 {
-            let mut last_include: Option<u32> = None;
-            let mut dts_v1_line: Option<u32> = None;
-            for (i, line) in source.lines().enumerate() {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("#include") {
-                    last_include = Some(i as u32);
-                } else if dts_v1_line.is_none() && trimmed.starts_with("/dts-v1/") {
-                    dts_v1_line = Some(i as u32);
-                }
-            }
-            last_include
-                .or(dts_v1_line)
-                .map(|line| line + 1)
-                .unwrap_or(0)
-        }
-
         fn property_value_completion(
             this: &Backend,
             project: &Project,
@@ -1226,6 +1206,254 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn references(
+        &self,
+        params: ReferenceParams,
+    ) -> Result<Option<Vec<Location>>> {
+        let Some(file_path) = self
+            .url_to_file_path(&params.text_document_position.text_document.uri)
+            .await
+        else {
+            return Ok(None);
+        };
+        let pos = position_to_ginko_position(params.text_document_position.position);
+        let project = self.project.read();
+        let Some(target) = project.node_target_at(&file_path, &pos) else {
+            return Ok(None);
+        };
+        let mut locations: Vec<Location> = project
+            .references_to_target(&target)
+            .into_iter()
+            .filter(|(file, _)| *file == file_path || params.context.include_declaration)
+            .map(|(file, span)| {
+                Location::new(
+                    Url::from_file_path(file).unwrap(),
+                    ginko_span_to_range(span),
+                )
+            })
+            .collect();
+        // the definition itself joins when asked (include_declaration) or
+        // when the request comes from the target's own file — nvim plugs
+        // the result straight into the quickfix list
+        if params.context.include_declaration {
+            locations.push(Location::new(
+                Url::from_file_path(&target.1).unwrap(),
+                ginko_span_to_range(target.0),
+            ));
+        }
+        locations.dedup();
+        Ok((!locations.is_empty()).then_some(locations))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let Some(file_path) = self
+            .url_to_file_path(&params.text_document_position_params.text_document.uri)
+            .await
+        else {
+            return Ok(None);
+        };
+        let pos = position_to_ginko_position(params.text_document_position_params.position);
+        let project = self.project.read();
+        let Some(target) = project.node_target_at(&file_path, &pos) else {
+            return Ok(None);
+        };
+        let mut highlights: Vec<DocumentHighlight> = project
+            .references_to_target(&target)
+            .into_iter()
+            .filter(|(file, _)| *file == file_path)
+            .map(|(_, span)| DocumentHighlight {
+                range: ginko_span_to_range(span),
+                kind: Some(DocumentHighlightKind::TEXT),
+            })
+            .collect();
+        // the definition itself lights up with the WRITE kind when it
+        // lives in the requested document
+        if target.1.as_ref() == file_path.as_path() {
+            highlights.push(DocumentHighlight {
+                range: ginko_span_to_range(target.0),
+                kind: Some(DocumentHighlightKind::WRITE),
+            });
+        }
+        Ok((!highlights.is_empty()).then_some(highlights))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let Some(file_path) = self
+            .url_to_file_path(&params.text_document.uri)
+            .await
+        else {
+            return Ok(None);
+        };
+        let project = self.project.read();
+        let Some(root) = project.get_root(&file_path) else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        // `#include` runs fold as import blocks: the first include's
+        // line through the LAST include's line, fully collapsed
+        let mut include_run: Option<(u32, u32)> = None;
+        for element in &root.elements {
+            match element {
+                Primary::Directive(AnyDirective::Include(include)) => {
+                    let start = include.span().start().line();
+                    let end = include.span().end().line();
+                    match include_run {
+                        Some((run_start, run_end)) if start <= run_end + 1 => {
+                            include_run = Some((run_start, run_end.max(end)));
+                        }
+                        Some((run_start, run_end)) => {
+                            out.push(imports_fold(run_start, run_end));
+                            include_run = Some((start, end));
+                        }
+                        None => include_run = Some((start, end)),
+                    }
+                }
+                Primary::Root(node) => push_node_fold(node, &mut out),
+                Primary::ReferencedNode(referenced) => {
+                    // overlay heads fold like nodes: keep `&label {` and
+                    // the closing `};` visible
+                    push_span_fold(referenced.span.start().line(), referenced.span.end().line(), &mut out);
+                    for item in &referenced.payload.items {
+                        if let NodeItem::Node(child) = item {
+                            push_node_fold(child, &mut out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((start, end)) = include_run {
+            out.push(imports_fold(start, end));
+        }
+        Ok(Some(out))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let Some(file_path) = self
+            .url_to_file_path(&params.text_document.uri)
+            .await
+        else {
+            return Ok(None);
+        };
+        let anchor = position_to_ginko_position(params.range.start);
+        let project = self.project.read();
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+        // required-missing quick fix: the node under the action range
+        // gets one insert action per unmet plain requirement (and each
+        // dependentRequired dependent), with the boolean shape spelled
+        // bare. Actions never fabricate values — `prop = ;` leaves the
+        // fill to the user, `prop;` for `name: true`-shaped shapes via
+        // the shared query's kind
+        // required-missing quick fix: InNode AND InProperty anchors both
+        // resolve to the governed node (nvim passes the diagnostic's own
+        // range — the compatible property — as the action anchor)
+        let anchor_context = project.completion_context_at(&file_path, &anchor);
+        let Some(rnode) = (match anchor_context {
+            Some(CompletionContext::InNode(rnode)) => Some(rnode),
+            Some(CompletionContext::InProperty(rnode, _)) => Some(rnode),
+            Some(CompletionContext::TopLevel) | None => None,
+        }) else {
+            return Ok(None);
+        };
+        // the most recent definition of the node IN THIS FILE owns the
+        // insert anchor: its header line and indentation (the name
+        // column counts tabs) place the inserted property. Sources
+        // store canonical paths — compare against the canonical request
+        // path; WITHOUT a local definition (pure overlay targets) the
+        // inserts cannot anchor and only the include fix below serves
+        let canonical = project.canonical_path(&file_path);
+        let header = rnode
+            .sources()
+            .filter(|location| location.file() == canonical.as_path())
+            .last()
+            .map(|location| location.span());
+        if let Some(header) = header {
+            let compatibles = node_compatibles(rnode);
+            for missing in missing_requirements(&self.bindings, &compatibles, rnode) {
+                let (label, insertion) = match &missing.kind {
+                    RequirementKind::Plain { boolean } => (
+                        format!("Insert required property `{}`", missing.name),
+                        if *boolean {
+                            format!("{};", missing.name)
+                        } else {
+                            format!("{} = ;", missing.name)
+                        },
+                    ),
+                    RequirementKind::Alternation { .. } => continue,
+                    RequirementKind::Dependent { trigger } => (
+                        format!(
+                            "Insert required property `{}` (alongside `{trigger}`)",
+                            missing.name
+                        ),
+                        format!("{} = ;", missing.name),
+                    ),
+                };
+                let header_line = header.start().line();
+                // indent = the header line's OWN leading tabs + one: spans
+                // start at the NAME token (past any label), so the name
+                // column is NOT the indentation
+                let line_indent = project
+                    .file_source(&file_path)
+                    .and_then(|source| source.lines().nth(header.start().line() as usize))
+                    .map(|line| line.chars().take_while(|c| *c == '\t').count())
+                    .unwrap_or(0);
+                let indent = &"\t".repeat(line_indent + 1);
+                let insert_at = Position::new(header_line + 1, 0);
+                let text = format!("{indent}{insertion}\n");
+                let edit = WorkspaceEdit {
+                    changes: Some(HashMap::from([(
+                        params.text_document.uri.clone(),
+                        vec![TextEdit::new(Range::new(insert_at, insert_at), text)],
+                    )])),
+                    ..Default::default()
+                };
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: label,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    edit: Some(edit),
+                    ..Default::default()
+                }));
+            }
+        }
+
+        // include quick fix: an identifier under the range that a binding
+        // define family ships — the action adds the family's
+        // `#include` line (the same machinery auto-include completion
+        // uses; the edit is the identical text)
+        // a mid-token code-action anchor names the WHOLE identifier: the
+        // completion-grade `token_at` cuts at the cursor (a typing prefix)
+        let token = match project.find_at_pos(&file_path, &anchor) {
+            Some(ItemAtCursor::Macro(macro_token)) => Some(macro_token.item().clone()),
+            _ => project.token_at(&file_path, &anchor),
+        };
+        if let Some(token) = token {
+            if !token.is_empty() {
+                if let Some(edit) = self.include_fix(&project, &file_path, &anchor, &token) {
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Add #include for `{token}`"),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(HashMap::from([(
+                                params.text_document.uri.clone(),
+                                vec![edit],
+                            )])),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+        Ok((!actions.is_empty()).then_some(actions))
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let Some(file_path) = self
             .url_to_file_path(&params.text_document_position_params.text_document.uri)
@@ -1235,22 +1463,40 @@ impl LanguageServer for Backend {
         };
         let pos = position_to_ginko_position(params.text_document_position_params.position);
         let project = self.project.read();
+
+        // binding-inspector PROPERTY hover first: every position inside a
+        // property span resolves InProperty — the property's own binding
+        // description IS the debugging read there. Node-header positions
+        // fall through to the item machinery below
+        if let Some(ResolvedContext::Property(_)) = project.context_at(&file_path, &pos) {
+            if let Some(contents) =
+                property_inspector_hover(&project, &file_path, &pos, &self.bindings)
+            {
+                return Ok(Some(Hover {
+                    contents,
+                    range: None,
+                }));
+            }
+        }
+
         let Some(item) = project.find_at_pos(&file_path, &pos) else {
             return Ok(None);
         };
 
-        let Some(str) = (match item {
+        let Some(contents) = (match item {
             ItemAtCursor::Node(node) if node.span().start().line() == pos.line() => {
-                context_based_hover(&project, &file_path, &pos)
+                node_inspector_hover(&project, &file_path, &pos, &self.bindings)
             }
             ItemAtCursor::ReferencedNode(rnode) if rnode.span().start().line() == pos.line() => {
-                context_based_hover(&project, &file_path, &pos)
+                node_inspector_hover(&project, &file_path, &pos, &self.bindings)
             }
-            ItemAtCursor::Reference(reference, ctx) => {
-                project.document_reference(&file_path, reference, &ctx)
+            ItemAtCursor::Reference(reference, ctx) => project
+                .document_reference(&file_path, reference, &ctx)
+                .map(dts_scalar),
+            ItemAtCursor::Label(name) => Some(dts_scalar(name.item().clone())),
+            ItemAtCursor::Include(include) => {
+                Some(dts_scalar(include.file_name.item().clone().path))
             }
-            ItemAtCursor::Label(name) => Some(name.item().clone()),
-            ItemAtCursor::Include(include) => Some(include.file_name.item().clone().path),
             ItemAtCursor::Macro(token) => 'block: {
                 let Some(ctx) = project.get_analysis(&file_path) else {
                     break 'block None;
@@ -1262,9 +1508,9 @@ impl LanguageServer for Backend {
 
                 match ctx.resolve_value(token) {
                     Some(resolved) if resolved != define.body => {
-                        Some(format!("{}\n{}", base, resolved))
+                        Some(dts_scalar(format!("{}\n{}", base, resolved)))
                     }
-                    Some(_) | None => Some(base),
+                    Some(_) | None => Some(dts_scalar(base)),
                 }
             }
 
@@ -1274,10 +1520,7 @@ impl LanguageServer for Backend {
         };
 
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::LanguageString(LanguageString {
-                language: "dts".to_string(),
-                value: str.to_string(),
-            })),
+            contents,
             range: None,
         }))
     }
@@ -1427,6 +1670,146 @@ fn property_value_snippet<S: AsRef<str>>(name: S, boolean: bool, type_hint: Opti
     }
 }
 
+/// Ancestor-composed child binding hints for the position: every
+/// binding-bearing ancestor of the position (pinctrl groups, LEDs,
+/// endpoints, ...) contributes child-position property hints.
+pub fn child_binding_hints(
+    project: &Project,
+    file_path: &Path,
+    pos: &ginko::dts::Position,
+    bindings: &Bindings,
+) -> Option<BTreeMap<String, ginko::dts::PropertyHint>> {
+    let analysis = project.get_analysis(file_path)?;
+    let tree = analysis.get_resolved_tree();
+    let file = project.canonical_path(file_path);
+    let (_, trail) = tree.node_and_path_at_position(&file, pos)?;
+    let mut merged: BTreeMap<String, ginko::dts::PropertyHint> = BTreeMap::new();
+    for split in (0..trail.len()).rev() {
+        let Some(ancestor) = tree.node_at_path(&trail[..split]) else {
+            continue;
+        };
+        let hints = bindings.child_properties_for(&node_compatibles(ancestor), &trail[split..]);
+        for (name, hint) in hints {
+            merge_hint(merged.entry(name).or_default(), &hint);
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
+/// The FIRST binding hint for a property at the position: the node's
+/// own binding first, then ancestor child hints, then the common
+/// schemas — the precedence every binding-aware surface uses.
+fn property_hints_at(
+    project: &Project,
+    file_path: &Path,
+    pos: &ginko::dts::Position,
+    rnode: &ResolvedNode,
+    name: &str,
+    bindings: &Bindings,
+) -> Option<ginko::dts::PropertyHint> {
+    if let Some(hint) = bindings.properties_for(&node_compatibles(rnode)).get(name) {
+        return Some(hint.clone());
+    }
+    if let Some(hint) = child_binding_hints(project, file_path, pos, bindings)
+        .and_then(|hints| hints.get(name).cloned())
+    {
+        return Some(hint);
+    }
+    bindings.common_hint(name).cloned()
+}
+
+/// One fold covering lines `start+1 .. close`, keeping the header line
+/// (the fold displays it) and the closing line visible. Folds need at
+/// least one interior line to be worth rendering.
+fn push_span_fold(start_line: u32, close_line: u32, out: &mut Vec<FoldingRange>) {
+    if close_line > start_line + 1 {
+        out.push(FoldingRange {
+            start_line,
+            end_line: close_line - 1,
+            start_character: None,
+            end_character: None,
+            kind: None,
+            collapsed_text: None,
+        });
+    }
+}
+
+fn push_node_fold(node: &Node, out: &mut Vec<FoldingRange>) {
+    push_span_fold(node.span.start().line(), node.span.end().line(), out);
+    for item in &node.payload.items {
+        if let NodeItem::Node(child) = item {
+            push_node_fold(child, out);
+        }
+    }
+}
+
+fn imports_fold(start_line: u32, end_line: u32) -> FoldingRange {
+    FoldingRange {
+        start_line,
+        end_line,
+        start_character: None,
+        end_character: None,
+        kind: Some(FoldingRangeKind::Imports),
+        collapsed_text: None,
+    }
+}
+
+/// The DTS spelling of a binding-relative header path: strip the
+/// leading `include/` — `#include <dt-bindings/…>` resolves against
+/// the `--include` roots.
+fn dts_include_path(relative: &str) -> String {
+    relative
+        .strip_prefix("include/")
+        .unwrap_or(relative)
+        .to_string()
+}
+
+/// The `#include <…>` TextEdit to attach to header-define completion
+/// items (and the include quick fix) when the family's defines are not
+/// yet in scope for the completed file. None when an already-included
+/// header (directly or transitively) provides the defines.
+/// `include_line` is the full statement to insert (`#include <…>` or
+/// `#include "…"`).
+fn additional_include_edit(
+    project: &Project,
+    file_path: &Path,
+    representative_define: &str,
+    include_line: &str,
+) -> Option<TextEdit> {
+    if project
+        .get_analysis(file_path)
+        .and_then(|analysis| analysis.get_define(representative_define))
+        .is_some()
+    {
+        return None;
+    }
+    let source = project.file_source(file_path)?;
+    let line = include_insert_line(source);
+    Some(TextEdit {
+        range: Range::new(Position::new(line, 0), Position::new(line, 0)),
+        new_text: format!("{include_line}\n"),
+    })
+}
+
+/// Insert the new `#include` after the last existing one, else after
+/// the `/dts-v1/;` directive, else at the top of the file.
+fn include_insert_line(source: &str) -> u32 {
+    let mut last_include: Option<u32> = None;
+    let mut dts_v1_line: Option<u32> = None;
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#include") {
+            last_include = Some(i as u32);
+        } else if dts_v1_line.is_none() && trimmed.starts_with("/dts-v1/") {
+            dts_v1_line = Some(i as u32);
+        }
+    }
+    last_include
+        .or(dts_v1_line)
+        .map(|line| line + 1)
+        .unwrap_or(0)
+}
+
 fn ginko_span_to_range(span: Span) -> Range {
     Range::new(
         ginko_position_to_position(span.start()),
@@ -1450,14 +1833,131 @@ fn ginko_position_to_position(position: ginko::dts::Position) -> Position {
     Position::new(position.line(), position.character())
 }
 
-fn context_based_hover(
+/// Plain hover content: the value shown as a dts code block (the
+/// historical shape for references, labels, includes and macros).
+fn hover_markdown(value: String) -> HoverContents {
+    HoverContents::Markup(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    })
+}
+
+fn dts_scalar(value: String) -> HoverContents {
+    HoverContents::Scalar(MarkedString::LanguageString(LanguageString {
+        language: "dts".to_string(),
+        value,
+    }))
+}
+
+/// The binding-inspector hover for the node at the cursor: the resolved
+/// path in a dts fence (what hover always showed) plus the CONTRACT the
+/// corpus demands — accepted binding file stems, the unmet requirements
+/// with the validator's own either/or and dependentRequired phrasing,
+/// and the nodename pattern. A node nothing accepts says so through the
+/// documented-strings oracle — the bondless Hint's read, minus the Hint.
+fn node_inspector_hover(
     project: &Project,
     file_path: &Path,
     pos: &ginko::dts::Position,
-) -> Option<String> {
-    match project.context_at(file_path, pos) {
-        Some(ResolvedContext::Node(rnode)) => Some(rnode.to_string()),
-        Some(ResolvedContext::Property(_)) => None,
-        None => None,
+    bindings: &Bindings,
+) -> Option<HoverContents> {
+    let Some(ResolvedContext::Node(rnode)) = project.context_at(file_path, pos) else {
+        return None;
+    };
+    let mut out = format!("```dts\n{rnode}\n```\n");
+    let compatibles = node_compatibles(rnode);
+    if compatibles.is_empty() {
+        return Some(hover_markdown(out));
     }
+    let views = bindings.normative_views(&compatibles);
+    if views.is_empty() {
+        let unknown: Vec<&String> = compatibles
+            .iter()
+            .filter(|compatible| !bindings.documents(compatible))
+            .collect();
+        if !unknown.is_empty() {
+            let joined = unknown
+                .iter()
+                .map(|compatible| format!("`{compatible}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\n**no binding documents** {joined}\n"));
+        }
+        return Some(hover_markdown(out));
+    }
+    let stems = views
+        .iter()
+        .map(|(stem, _)| format!("`{stem}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!("\n**binding:** {stems}\n"));
+    for missing in missing_requirements(bindings, &compatibles, rnode) {
+        let line = match &missing.kind {
+            RequirementKind::Plain { .. } => {
+                format!("- `{}` — required by `{}`\n", missing.name, missing.binding)
+            }
+            RequirementKind::Alternation { phrase } => {
+                format!("- one of: {phrase} — required by `{}`\n", missing.binding)
+            }
+            RequirementKind::Dependent { trigger } => format!(
+                "- `{}` — alongside `{trigger}` (required by `{}`)\n",
+                missing.name, missing.binding
+            ),
+        };
+        out.push_str(&line);
+    }
+    for (stem, schema) in &views {
+        if let Some(pattern) = &schema.nodename {
+            out.push_str(&format!("\n**nodename:** `{pattern}` ({stem})\n"));
+        }
+    }
+    Some(hover_markdown(out))
+}
+
+/// Property hover: the binding's own description for the property under
+/// the cursor, plus requiredness, type and a small value preview — the
+/// debugging read of what the schema wants here.
+fn property_inspector_hover(
+    project: &Project,
+    file_path: &Path,
+    pos: &ginko::dts::Position,
+    bindings: &Bindings,
+) -> Option<HoverContents> {
+    let Some(CompletionContext::InProperty(rnode, property)) =
+        project.completion_context_at(file_path, pos)
+    else {
+        return None;
+    };
+    let name = property.property().name.item().clone();
+    let hint = property_hints_at(project, file_path, pos, rnode, &name, bindings)?;
+    let mut out = format!("```dts\n{name}\n```\n");
+    let required = if hint.required {
+        "required"
+    } else {
+        "optional"
+    };
+    out.push_str(&format!("\n**{required}**"));
+    if hint.boolean {
+        out.push_str(" — boolean");
+    } else if let Some(ty) = &hint.type_hint {
+        out.push_str(&format!(" — type `{ty}`"));
+    }
+    out.push('\n');
+    if let Some(description) = &hint.description {
+        out.push_str(&format!("\n{}\n", description.trim()));
+    }
+    if !hint.values.is_empty() {
+        let preview: Vec<String> = hint
+            .values
+            .iter()
+            .take(6)
+            .map(|value| format!("`{value}`"))
+            .collect();
+        out.push_str(&format!("\nvalues: {}", preview.join(", ")));
+        if hint.values.len() > 6 {
+            out.push_str(" …");
+        }
+        out.push('\n');
+    }
+    Some(hover_markdown(out))
 }

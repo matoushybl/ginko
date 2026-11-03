@@ -22,6 +22,18 @@ pub enum ItemAtCursor<'a> {
     Macro(&'a WithToken<String>),
 }
 
+/// Every reference of a file with its enclosing node context — the
+/// reverse-lookup companion of `item_at_cursor`: reference listing
+/// (`textDocument/references`) and document highlight walk the whole
+/// file, resolving every `&label` / `&{/path}` / overlay head /
+/// delete-directive target on demand. The WITH-TOKEN form keeps the
+/// source span for location output.
+#[derive(Debug, Clone)]
+pub struct CollectedReference<'a> {
+    pub token: &'a WithToken<Reference>,
+    pub context: ReferenceContext<'a>,
+}
+
 impl DtsFile {
     pub fn item_at_cursor(&self, cursor: &Position) -> Option<ItemAtCursor<'_>> {
         for element in &self.elements {
@@ -30,6 +42,12 @@ impl DtsFile {
             }
         }
         None
+    }
+
+    pub fn collect_references<'a>(&'a self, out: &mut Vec<CollectedReference<'a>>) {
+        for element in &self.elements {
+            element.collect_references(out);
+        }
     }
 }
 
@@ -195,6 +213,110 @@ impl PropertyValue {
                     None
                 }
             }
+        }
+    }
+
+    pub fn collect_references<'a>(&'a self, refs: &mut Vec<CollectedReference<'a>>, ctx: &ReferenceContext<'a>) {
+        match self {
+            PropertyValue::String(_) | PropertyValue::ByteStrings(..) | PropertyValue::Incbin(..) => {}
+            PropertyValue::Cells(_, cells, _) => {
+                for cell in cells {
+                    if let Cell::Reference(reference) = cell {
+                        refs.push(CollectedReference {
+                            token: reference,
+                            context: ctx.clone(),
+                        });
+                    }
+                }
+            }
+            PropertyValue::Reference(reference) => refs.push(CollectedReference {
+                token: reference,
+                context: ctx.clone(),
+            }),
+        }
+    }
+}
+
+impl Primary {
+    pub fn collect_references<'a>(&'a self, refs: &mut Vec<CollectedReference<'a>>) {
+        match self {
+            Primary::Directive(directive) => directive.collect_references(refs),
+            Primary::Root(root) => root.collect_references(refs),
+            Primary::ReferencedNode(node) => node.collect_references(refs),
+        }
+    }
+}
+
+impl AnyDirective {
+    pub fn collect_references<'a>(&'a self, refs: &mut Vec<CollectedReference<'a>>) {
+        match self {
+            // delete/omit directives carry a reference with Root context
+            AnyDirective::DeletedNode(_, node_ref) | AnyDirective::OmitIfNoRef(_, node_ref) => {
+                refs.push(CollectedReference {
+                    token: node_ref,
+                    context: ReferenceContext::Root,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ReferencedNode {
+    pub fn collect_references<'a>(&'a self, refs: &mut Vec<CollectedReference<'a>>) {
+        // the overlay head itself is a reference at Root level...
+        refs.push(CollectedReference {
+            token: &self.reference,
+            context: ReferenceContext::Root,
+        });
+        // ...and the payload's property values resolve relative to the
+        // overlay position — the plain walk answers for the inlined payload
+        let ctx = ReferenceContext::Root;
+        self.payload.collect_references(refs, &ctx);
+    }
+}
+
+impl Node {
+    pub fn collect_references<'a>(&'a self, refs: &mut Vec<CollectedReference<'a>>) {
+        let ctx = ReferenceContext::Node(self);
+        self.payload.collect_references(refs, &ctx);
+    }
+}
+
+impl NodePayload {
+    pub fn collect_references<'a>(
+        &'a self,
+        refs: &mut Vec<CollectedReference<'a>>,
+        ctx: &ReferenceContext<'a>,
+    ) {
+        for node in &self.items {
+            node.collect_references(refs, ctx);
+        }
+    }
+}
+
+impl NodeItem {
+    pub fn collect_references<'a>(
+        &'a self,
+        refs: &mut Vec<CollectedReference<'a>>,
+        ctx: &ReferenceContext<'a>,
+    ) {
+        match self {
+            NodeItem::Property(property) => property.collect_references(refs, ctx),
+            NodeItem::Node(node) => node.collect_references(refs),
+            NodeItem::DeletedNode(..) | NodeItem::DeletedProperty(..) => {}
+        }
+    }
+}
+
+impl Property {
+    pub fn collect_references<'a>(
+        &'a self,
+        refs: &mut Vec<CollectedReference<'a>>,
+        ctx: &ReferenceContext<'a>,
+    ) {
+        for value in &self.values {
+            value.collect_references(refs, ctx);
         }
     }
 }
