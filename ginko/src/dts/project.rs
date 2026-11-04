@@ -503,6 +503,54 @@ impl Project {
         out
     }
 
+    /// The per-file PROJECT tier of compatible VALUE completion: the
+    /// file's own literal `compatible = "..."` strings plus its include
+    /// closure's, first-seen order (the file first, then includes
+    /// depth-first). The closure is the same universe goto and
+    /// references see — what an LSP session actually covers — and it
+    /// answers from what the project itself declares (board dtsi
+    /// extensions, carrier strings the corpus never documents) instead
+    /// of from the bindings index. `typing` is the property being
+    /// completed RIGHT NOW: its occurrences are excluded — a half-typed
+    /// `compatible = "im"` mid-typing is cursor noise, not a
+    /// declaration, and the corpus tiers behind it must not move.
+    pub fn closure_compatible_strings(&self, path: &Path, typing: &Span) -> Vec<String> {
+        #[allow(clippy::mutable_key_type)]
+        let mut seen_files: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut out: Vec<String> = Vec::new();
+        let Some(start) = self.canonicalize(path).ok() else {
+            return out;
+        };
+        let mut queue = vec![start];
+        while let Some(file) = queue.pop() {
+            if !seen_files.insert(file.clone()) {
+                continue;
+            }
+            let Some(project_file) = self.files.get(&file) else {
+                continue;
+            };
+            let mut includes_next = project_file.includes.clone();
+            includes_next.reverse();
+            queue.extend(includes_next);
+            if let Some(dts) = &project_file.file {
+                let mut batch = Vec::new();
+                dts.compatible_strings(&mut batch);
+                for (string, span) in batch {
+                    // within the property being typed: start contained, end
+                    // within-or-equal (Span::contains is half-open, the
+                    // property's own end is NOT a contained position)
+                    if typing.contains(&span.start()) && typing.end() >= span.end() {
+                        continue;
+                    }
+                    if !out.contains(&string) {
+                        out.push(string);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn node_at_absolute_path<'a>(
         &'a self,
         ctx: &'a AnalysisContext,
@@ -779,7 +827,7 @@ mod tests {
     use crate::dts::test::Code;
     use crate::dts::tokens::TokenKind;
     use crate::dts::visitor::ReferenceContext;
-    use crate::dts::{ast, Diagnostic, HasSpan, ItemAtCursor, Project};
+    use crate::dts::{ast, Diagnostic, HasSpan, ItemAtCursor, Position, Project, Span};
     use assert_matches::assert_matches;
     use itertools::Itertools;
     use std::fs;
@@ -1938,5 +1986,79 @@ mod tests {
         let refs = project.references_to_target(&target);
         assert_eq!(refs.len(), 2, "{refs:#?}");
         assert!(refs.iter().all(|(file, _)| *file == file2_canon));
+    }
+
+    #[test]
+    pub fn closure_compatible_strings_first_seen_and_typing_excluded() {
+        // the PROJECT tier of compatible VALUE completion: the file's
+        // own literal `compatible = "..."` strings plus its include
+        // closure's, first-seen order (the file first, then includes
+        // depth-first); the property currently being typed is EXCLUDED
+        // (a half-typed value is cursor noise, not a declaration, and
+        // the corpus tiers must not move under it); empty strings never
+        // join
+        let mut project = Project::default();
+        let mut loader = IncludeLoaderGuard::default();
+        let temp_dir = TempDir::new();
+        let (code1, file1) = temp_dir.add_file(
+            "tests-carrier.dtsi",
+            r#"/ {
+	acme0: inside-0 {
+		compatible = "acme,ancillary";
+	};
+	acme1: inside-1 {
+		compatible = "";
+	};
+	acme2: inside-2 {
+		compatible = "acme,backup";
+	};
+};
+"#,
+        );
+        let (code2, file2) = temp_dir.add_file(
+            "tests-board.dts",
+            format!(
+                r#"/dts-v1/;
+
+/include/ "{}"
+
+/ {{
+	board {{
+		compatible = "acme,main";
+	}};
+}};
+"#,
+                file1.display()
+            ),
+        );
+        project
+            .add_file(file2.clone().into_os_string().into_string().unwrap(), &mut loader)
+            .expect("Unexpected IO error");
+        project
+            .add_file(file1.clone().into_os_string().into_string().unwrap(), &mut loader)
+            .expect("Unexpected IO error");
+
+        // a span away from all value tokens excludes nothing
+        let neutral = Span::new(Position::new(99, 99), Position::new(99, 99));
+        let file2_canon = project.canonicalize(&file2).unwrap();
+        let strings = project.closure_compatible_strings(&file2_canon, &neutral);
+        assert_eq!(
+            strings,
+            vec![
+                "acme,main".to_string(),
+                "acme,ancillary".to_string(),
+                "acme,backup".to_string(),
+            ]
+        );
+
+        // the carrier's ancillary property being typed drops exactly its
+        // own strings; board and backup survive untouched
+        let typing =
+            Span::ranging(code1.s1("compatible").span(), code1.s1("\"acme,ancillary\"").span());
+        let strings = project.closure_compatible_strings(&file2_canon, &typing);
+        assert_eq!(
+            strings,
+            vec!["acme,main".to_string(), "acme,backup".to_string()]
+        );
     }
 }

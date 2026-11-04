@@ -154,6 +154,12 @@ pub struct ChildSchema {
     pub patterns: Vec<String>,
     /// Property name -> hint for the child node.
     pub properties: BTreeMap<String, PropertyHint>,
+    /// The child's OWN `$nodename` contract when its `$ref`'d schema
+    /// carries one (enetc's literal `mdio` child -> the mdio binding's
+    /// `^mdio(-(bus|external))?(@.+|-([0-9]+))?$`) — the same pattern
+    /// validation judges EXACTLY; the completion-side sample set joins it
+    /// so a suggestion can never contradict the validator.
+    pub nodename: Option<String>,
     /// Grandchildren: the child's own child-node schemas.
     pub children: Vec<ChildSchema>,
 }
@@ -471,6 +477,29 @@ impl Bindings {
                 for child in &self.schemas[*idx].children {
                     for pattern in &child.patterns {
                         out.extend(pattern_samples(pattern));
+                    }
+                    // the child's own $nodename is the rest of the naming
+                    // contract (the $ref'd binding's own view — enetc's
+                    // mdio child, the adc/dac channel children). Its
+                    // samples join ONLY when the child's KEY patterns
+                    // leniently accept them — the landed over-match law
+                    // is the completion-side arbiter: a suggestion and
+                    // the matcher that lights up the typed node must
+                    // agree, so fixed-name children stay fixed
+                    // (`^mdio$` drops `mdio-bus`) while the optional-*
+                    // address spellings the keys already over-match
+                    // surface (`^channel@[0-9a-f]+$` gains bare
+                    // `channel` — its $ref'd binding says `^channel(@…)?$`)
+                    if let Some(nodename) = &child.nodename {
+                        for sample in pattern_samples(nodename) {
+                            if child
+                                .patterns
+                                .iter()
+                                .any(|pattern| alternative_matches(pattern, &sample))
+                            {
+                                out.insert(sample);
+                            }
+                        }
                     }
                 }
             }
@@ -1191,7 +1220,22 @@ fn property_hint(sub: &Value, required: bool) -> PropertyHint {
             ..PropertyHint::default()
         };
     };
-    let type_hint = sub.get("$ref").and_then(Value::as_str).and_then(type_ref_tail);
+    // hints come from types.yaml $ref tails; a bare `type:` string fills the
+    // gap LEFT open (the living corpus types every string via $ref — the
+    // corpus audit for this round found ZERO bare `type: string` schemas —
+    // but out-of-tree bindings may spell it directly). Only the two
+    // string kinds quote; integer/array/object keep the raw hand and
+    // boolean has its own flag above.
+    let type_hint = sub
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(type_ref_tail)
+        .or_else(|| {
+            sub.get("type")
+                .and_then(Value::as_str)
+                .filter(|kinded| matches!(*kinded, "string" | "string-array"))
+                .map(str::to_string)
+        });
     let description = sub.get("description").and_then(Value::as_str).map(str::to_string);
     let deprecated = matches!(sub.get("deprecated"), Some(Value::Bool(true)));
     // the kernel-idiomatic boolean spelling: `name: {type: boolean}`
@@ -1593,9 +1637,18 @@ fn child_schema_for(
         }
     }
     let children = extract_children(subschema, origin_file, roots, ref_cache, depth + 1, documented);
+    // the child's own $nodename: the subschema's own view first, $ref-
+    // inherited ones only fill the gap (the binding-level policy)
+    let mut nodename = None;
+    for (view, _) in &heads {
+        if nodename.is_none() {
+            nodename = extract_nodename(view);
+        }
+    }
     ChildSchema {
         patterns,
         properties,
+        nodename,
         children,
     }
 }
@@ -2506,6 +2559,92 @@ patternProperties:
         assert!(bindings
             .child_node_samples(&["vendor,unknown".to_string()])
             .is_empty());
+    }
+
+    const CHILD_NODENAME_BINDING: &str = r#"
+properties:
+  compatible:
+    const: vendor,governor
+patternProperties:
+  "^mdio$":
+    type: object
+    properties:
+      $nodename:
+        pattern: "^mdio(-(bus|external))?(@.+|-([0-9]+))?$"
+      compatible:
+        type: object
+  "^channel@[0-9a-f]+$":
+    type: object
+    properties:
+      $nodename:
+        pattern: "^channel(@[0-9a-f]+)?$"
+      reg:
+        description: channel register
+"#;
+
+    #[test]
+    pub fn child_nodename_samples_join_through_the_lenient_key_law() {
+        // the child's own $nodename (normally living on its $ref'd
+        // binding) joins the sample set ONLY when the child's KEY
+        // patterns leniently accept it — the landed over-match law is
+        // the arbiter, so suggestions and the matcher that lights up
+        // the typed node can never disagree
+        let binding: Value = serde_yaml::from_str(CHILD_NODENAME_BINDING).unwrap();
+        let mut bindings = Bindings::default();
+        bindings.add_schema(PathBuf::from("vendor/governor.yaml"), &binding);
+        let samples = bindings.child_node_samples(&["vendor,governor".to_string()]);
+        // the mdio child: its nodename's optional groups freeze to the
+        // head (`mdio-bus` never samples) and the fixed-name key keeps
+        // it exactly `mdio` anyway
+        assert!(samples.contains(&"mdio".to_string()));
+        // the channel child: the KEY mandates the unit address (its
+        // lenient form requires the `channel@` head), so the nodename's
+        // bare `channel` — a name the key matcher itself rejects —
+        // must NOT join; `channel@0` remains the sample
+        assert!(samples.contains(&"channel@0".to_string()));
+        assert!(!samples.contains(&"channel".to_string()));
+        assert!(!samples.contains(&"mdio-bus".to_string()));
+    }
+
+    #[test]
+    pub fn bare_type_fills_the_type_hint_gap_behind_the_ref_tail() {
+        // types.yaml $ref tails remain the corpus source; a bare
+        // `type: string`/`string-array` only FILLS the gap (the round's
+        // corpus audit found zero bare-string schemas — this hardens
+        // for out-of-tree bindings); every other bare type keeps its
+        // raw home and boolean rides its own flag
+        let parsed: Value = serde_yaml::from_str(
+            r#"
+properties:
+  plain:
+    type: string
+  several:
+    type: string-array
+  ref-beats-bare:
+    type: uint32
+    $ref: /schemas/types.yaml#/definitions/string-array
+  cells:
+    type: uint32
+  flag:
+    type: boolean
+"#,
+        )
+        .unwrap();
+        let props = parsed.get("properties").unwrap();
+        let sub = |name: &str| props.get(name).unwrap();
+        assert_eq!(property_hint(sub("plain"), false).type_hint.as_deref(), Some("string"));
+        assert_eq!(
+            property_hint(sub("several"), false).type_hint.as_deref(),
+            Some("string-array")
+        );
+        assert_eq!(
+            property_hint(sub("ref-beats-bare"), false).type_hint.as_deref(),
+            Some("string-array")
+        );
+        assert_eq!(property_hint(sub("cells"), false).type_hint, None);
+        let flag = property_hint(sub("flag"), false);
+        assert!(flag.boolean);
+        assert_eq!(flag.type_hint, None);
     }
 
     const STUB_BINDING: &str = r#"

@@ -913,40 +913,69 @@ impl LanguageServer for Backend {
                     });
                 }
             }
-            // STAGED COMMON-COMPATIBLES — the unbound compatible-value hole:
-            // every pool above is binding-keyed, so a value position inside a
-            // node NO binding accepts served nothing useful (the r12 mbus pin
-            // — the classic fallback degenerated to dtschema's two
-            // ethernet-phy constants). The corpus itself takes over when no
-            // binding accepts the node, in two stages: with little typed,
-            // the canonical tier of example-frequent documented strings
-            // (merged with the common-value constants); once at least two
-            // characters exist, fuzzy search over EVERY documented string —
-            // 20k subsequence probes cost ~1-2ms and the capped list stays
+            // STAGED COMPATIBLES FOR THE UNBOUND HOLE (r14 + this round's
+            // project tier): every pool above is binding-keyed, so a value
+            // position inside a node NO binding accepts served nothing
+            // useful (the r12 mbus pin — the classic fallback degenerated
+            // to dtschema's two ethernet-phy constants). THREE stages now,
+            // in priority order: the include closure's own declared
+            // strings (the project tier — what the board itself spells
+            // out), then the corpus — with little typed, the canonical
+            // tier of example-frequent documented strings (merged with
+            // the common-value constants); once at least two characters
+            // exist, fuzzy search over EVERY documented string — 20k
+            // subsequence probes cost ~1-2ms and the capped list stays
             // small. Governing bindings always win: matched/child hints
             // gate this branch off.
             if name == "compatible" && matched.is_none() && child_hint.is_none() {
                 let typed = value_prefix_at(project, file_path, pos, property).unwrap_or_default();
                 let fuzzed = typed.chars().count() >= 2;
-                let candidates: Vec<String> = if fuzzed {
-                    fuzzy_compatibles(bindings, &typed, 50)
+                // PROJECT TIER FIRST, then the corpus: the file's own
+                // include closure answers from what the project itself
+                // declares — board dtsi extensions, carrier strings the
+                // corpus never documents — ahead of both corpus stages
+                // (0-1 chars: first-seen order; fuzzed: plain substring
+                // matches, no subsequence game). The property being
+                // typed is excluded (cursor noise), and corpus entries
+                // already offered by the project tier do not repeat.
+                let project_tier =
+                    project.closure_compatible_strings(file_path, &property.property().span());
+                let candidates: Vec<(String, &'static str)> = if fuzzed {
+                    let mut staged: Vec<(String, &'static str)> = project_tier
+                        .iter()
+                        .filter(|label| label.contains(typed.as_str()))
+                        .map(|label| (label.clone(), "project compatible"))
+                        .collect();
+                    let offered: Vec<String> =
+                        staged.iter().map(|(l, _)| l.clone()).collect();
+                    for label in fuzzy_compatibles(bindings, &typed, 50) {
+                        if !offered.contains(&label) {
+                            staged.push((label, "documented compatible"));
+                        }
+                    }
+                    staged
                 } else {
+                    let mut staged: Vec<(String, &'static str)> = project_tier
+                        .into_iter()
+                        .map(|label| (label, "project compatible"))
+                        .collect();
+                    let offered: Vec<String> = staged.iter().map(|(l, _)| l.clone()).collect();
                     let mut tier = bindings.common_compatibles().to_vec();
                     for extra in bindings.common_values(name) {
                         if !tier.iter().any(|tierred| tierred == extra) {
                             tier.push(extra.clone());
                         }
                     }
-                    tier
+                    for label in tier {
+                        if !offered.contains(&label) {
+                            staged.push((label, "common compatible"));
+                        }
+                    }
+                    staged
                 };
                 if !candidates.is_empty() {
-                    let detail = if fuzzed {
-                        "documented compatible"
-                    } else {
-                        "common compatible"
-                    };
                     items.clear();
-                    for label in candidates {
+                    for (label, detail) in candidates {
                         items.push(CompletionItem {
                             label,
                             detail: Some(detail.to_string()),

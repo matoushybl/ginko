@@ -2,7 +2,7 @@ use crate::dts::ast::{
     AnyDirective, Cell, DtsFile, Include, Node, NodePayload, Primary, Property, PropertyValue,
     Reference, ReferencedNode, WithToken,
 };
-use crate::dts::{HasSpan, NodeItem, Position};
+use crate::dts::{HasSpan, NodeItem, Position, Span};
 
 #[derive(Debug, Clone)]
 pub enum ReferenceContext<'a> {
@@ -317,6 +317,73 @@ impl Property {
     ) {
         for value in &self.values {
             value.collect_references(refs, ctx);
+        }
+    }
+}
+
+// The compatible-string harvest: every `compatible = "..."` string
+// assignment of a file in first-seen source order, keeping each
+// string's span so the caller can exclude the property currently being
+// typed — the per-file project tier of compatible VALUE completion.
+// The corpus tiers answer from bindings; this pool answers from what
+// the project itself declares (board dtsi extensions, carrier strings
+// the corpus never documents). Only literal string values count:
+// macros, phandles and byte runs are skipped honestly, and so are
+// EMPTY strings — `compatible = ""` is cursor noise, not a
+// declaration.
+impl DtsFile {
+    pub fn compatible_strings(&self, out: &mut Vec<(String, Span)>) {
+        for element in &self.elements {
+            element.compatible_strings(out);
+        }
+    }
+}
+
+impl Primary {
+    pub fn compatible_strings(&self, out: &mut Vec<(String, Span)>) {
+        match self {
+            Primary::Directive(_) => {}
+            Primary::Root(root) => root.compatible_strings(out),
+            Primary::ReferencedNode(node) => node.payload.compatible_strings(out),
+        }
+    }
+}
+
+impl Node {
+    pub fn compatible_strings(&self, out: &mut Vec<(String, Span)>) {
+        self.payload.compatible_strings(out);
+    }
+}
+
+impl NodePayload {
+    pub fn compatible_strings(&self, out: &mut Vec<(String, Span)>) {
+        for node in &self.items {
+            node.compatible_strings(out);
+        }
+    }
+}
+
+impl NodeItem {
+    pub fn compatible_strings(&self, out: &mut Vec<(String, Span)>) {
+        match self {
+            NodeItem::Property(property) => property.compatible_strings(out),
+            NodeItem::Node(node) => node.compatible_strings(out),
+            NodeItem::DeletedNode(..) | NodeItem::DeletedProperty(..) => {}
+        }
+    }
+}
+
+impl Property {
+    pub fn compatible_strings(&self, out: &mut Vec<(String, Span)>) {
+        if self.name.item() != "compatible" {
+            return;
+        }
+        for value in &self.values {
+            if let PropertyValue::String(string) = value {
+                if !string.item().is_empty() {
+                    out.push((string.item().clone(), string.span()));
+                }
+            }
         }
     }
 }
